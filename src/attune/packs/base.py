@@ -11,6 +11,11 @@ class SignalSpec:
     key: str
     axis: Axis
     modality: str  # audio | vision | wearable | text | self_report
+    # Synthetic-patient generation params (consumed by attune.synth, not the engine):
+    normal: float = 0.0  # baseline mean
+    noise: float = 1.0  # day-to-day sd
+    flare: float = 0.0  # signed deterioration applied during a planted flare
+    cyclic: bool = False  # a phase counter (e.g. cycle day) rather than a noisy level
 
 
 @dataclass(frozen=True, slots=True)

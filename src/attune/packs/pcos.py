@@ -9,12 +9,12 @@ from attune.packs.base import BriefTemplate, ConditionPack, Coupling, Persona, S
 PCOS_PACK = ConditionPack(
     name="pcos",
     signals=(
-        SignalSpec("cycle_day", Axis.CYCLE, "self_report"),
-        SignalSpec("meal_gi", Axis.METABOLIC, "vision"),
-        SignalSpec("weight", Axis.METABOLIC, "wearable"),
-        SignalSpec("acne_score", Axis.DERMATOLOGICAL, "vision"),
-        SignalSpec("hirsutism_score", Axis.DERMATOLOGICAL, "vision"),
-        SignalSpec("mood_valence", Axis.PSYCHOLOGICAL, "audio"),
+        SignalSpec("cycle_day", Axis.CYCLE, "self_report", cyclic=True),
+        SignalSpec("meal_gi", Axis.METABOLIC, "vision", normal=45, noise=8, flare=+30),
+        SignalSpec("weight", Axis.METABOLIC, "wearable", normal=86, noise=0.4),
+        SignalSpec("acne_score", Axis.DERMATOLOGICAL, "vision", normal=3, noise=1, flare=+4),
+        SignalSpec("hirsutism_score", Axis.DERMATOLOGICAL, "vision", normal=4, noise=0.5),
+        SignalSpec("mood_valence", Axis.PSYCHOLOGICAL, "audio", normal=0.6, noise=0.08),
     ),
     couplings=(
         Coupling(
