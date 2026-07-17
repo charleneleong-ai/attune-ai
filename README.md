@@ -78,7 +78,9 @@ surfaces resources, and does a **warm human handoff**.
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-uv run pytest            # concordance + safety + pack logic
+uv run pytest            # concordance + safety + pack + brief + demo logic
+uv run attune-seed       # write seeded patients to data/
+uv run attune-demo       # narrate both packs end-to-end (or: attune-demo veteran)
 ```
 
 ```python
@@ -97,8 +99,8 @@ verdict = eng.assess("rough night, no sleep", day=30)   # Green / Amber / Red
    the reflection pass discovers live; `attune-seed` writes them to `data/`.
 3. **Capture** — wire `capture/` to Realtime (voice) + GPT-4o vision (skin/meal photos).
 4. ✅ **Brief generator** — maps memory onto the pack's `BriefTemplate` (Rotterdam / cardiometabolic).
-5. **Demo surface** — voice check-in that remembers → live concordant warning → clinician brief
-   → (veteran) scripted red-tier escalation → the PCOS↔veteran config hot-swap.
+5. ✅ **Demo surface (offline)** — `attune-demo`: timeline → live concordant warning → clinician
+   brief → AMBER/RED escalation → PCOS↔veteran hot-swap. Capture (step 3) swaps in live signals.
 
 ## Feasibility / credits
 

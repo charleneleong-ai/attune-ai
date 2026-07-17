@@ -3,10 +3,10 @@ import pytest
 from attune.concordance_engine.engine import Engine
 from attune.packs.pcos import PCOS_PACK
 from attune.packs.veteran import VETERAN_PACK
-from attune.synth import generate, load_memory, save
+from attune.synth import flare_window, generate, load_memory, save
 
-# generate() plants the flare over [days-12, days-7); at days=90 that is [78, 83).
-FLARE_DAY = 80
+WINDOW = flare_window(90)
+FLARE_DAY = WINDOW.midpoint
 CALM_DAY = 50
 
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import random
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import typer
@@ -23,6 +23,24 @@ from attune.packs.base import ConditionPack, SignalSpec
 CYCLE_DAYS = 28  # canonical cycle length for cyclic phase signals (e.g. cycle_day)
 
 
+@dataclass(frozen=True, slots=True)
+class FlareWindow:
+    onset: int
+    length: int
+
+    @property
+    def end(self) -> int:  # exclusive
+        return self.onset + self.length
+
+    @property
+    def midpoint(self) -> int:
+        return self.onset + self.length // 2
+
+
+def flare_window(days: int) -> FlareWindow:
+    return FlareWindow(days - 12, 5)  # a short flare near "today" so reflect() catches it live
+
+
 def sample(spec: SignalSpec, day: int, rng: random.Random) -> float:
     if spec.cyclic:
         return float(1 + day % CYCLE_DAYS)
@@ -31,12 +49,12 @@ def sample(spec: SignalSpec, day: int, rng: random.Random) -> float:
 
 def generate(pack: ConditionPack, *, days: int = 90, seed: int = 0) -> Memory:
     rng = random.Random(seed)
-    onset, flare_len = days - 12, 5  # a short flare near "today" so reflect() catches it live
+    window = flare_window(days)
     mem = Memory()
     for spec in pack.signals:
         for day in range(days):
             value = sample(spec, day, rng)
-            if onset <= day < onset + flare_len:
+            if window.onset <= day < window.end:
                 value += spec.flare  # 0.0 for signals that don't participate in the flare
             mem.add(Signal(spec.key, spec.axis, round(value, 2), day, source=spec.modality))
     return mem

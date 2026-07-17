@@ -29,7 +29,15 @@ class ConcordanceFinding:
     day: int
     load: float  # weighted composite deviation
     axes: list[AxisDeviation]
-    concordant: bool  # >= 2 axes deviate together — specificity over a single noisy channel
+    z_threshold: float = Z_THRESHOLD  # the threshold this finding was scored against
+
+    @property
+    def deviating_axes(self) -> list[str]:
+        return [a.axis for a in self.axes if a.z >= self.z_threshold]
+
+    @property
+    def concordant(self) -> bool:  # >= 2 axes deviate together — specificity over one noisy channel
+        return len(self.deviating_axes) >= 2
 
 
 def baseline_history(series: list[Signal], before_day: int, span: int = BASELINE_SPAN) -> list[float]:
@@ -67,5 +75,4 @@ def concordance(
     weights = weights or {}
     devs = deviations(mem, day, span, baseline_span, axis_of)
     load = sum(weights.get(d.axis, 1.0) * d.z for d in devs)
-    concordant = sum(d.z >= z_threshold for d in devs) >= 2
-    return ConcordanceFinding(day, load, devs, concordant)
+    return ConcordanceFinding(day, load, devs, z_threshold)
