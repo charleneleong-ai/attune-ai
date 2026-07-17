@@ -1,0 +1,65 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from statistics import median
+
+from attune.concordance_engine.memory import Memory
+
+MAD_TO_SIGMA = 0.6745  # scales median-absolute-deviation to a normal sigma
+
+
+def robust_z(value: float, history: list[float]) -> float:
+    if len(history) < 3:
+        return 0.0
+    med = median(history)
+    mad = median([abs(x - med) for x in history]) or 1e-9
+    return MAD_TO_SIGMA * (value - med) / mad
+
+
+@dataclass(frozen=True, slots=True)
+class AxisDeviation:
+    axis: str
+    z: float  # mean |robust z| across the axis's signals in the window
+
+
+@dataclass(frozen=True, slots=True)
+class ConcordanceFinding:
+    day: int
+    load: float  # weighted composite deviation
+    axes: list[AxisDeviation]
+    concordant: bool  # >= 2 axes deviate together — specificity over a single noisy channel
+
+
+def deviations(
+    mem: Memory, day: int, span: int, baseline_span: int, axis_of: dict[str, str]
+) -> list[AxisDeviation]:
+    cutoff = day - span + 1
+    baselines: dict[str, list[float]] = {}  # per-key history, computed once even if the key recurs
+    per_axis: dict[str, list[float]] = {}
+    for s in mem.window(day, span):
+        axis = axis_of.get(s.key)
+        if axis is None:
+            continue
+        history = baselines.get(s.key)
+        if history is None:
+            history = [h.value for h in mem.series(s.key) if h.day < cutoff][-baseline_span:]
+            baselines[s.key] = history
+        per_axis.setdefault(axis, []).append(abs(robust_z(s.value, history)))
+    return [AxisDeviation(axis, sum(zs) / len(zs)) for axis, zs in per_axis.items()]
+
+
+def concordance(
+    mem: Memory,
+    day: int,
+    axis_of: dict[str, str],
+    *,
+    span: int = 3,
+    baseline_span: int = 30,
+    z_threshold: float = 1.5,
+    weights: dict[str, float] | None = None,
+) -> ConcordanceFinding:
+    weights = weights or {}
+    devs = deviations(mem, day, span, baseline_span, axis_of)
+    load = sum(weights.get(d.axis, 1.0) * d.z for d in devs)
+    concordant = sum(d.z >= z_threshold for d in devs) >= 2
+    return ConcordanceFinding(day, load, devs, concordant)
