@@ -26,9 +26,15 @@ class Coupling:
 
 
 @dataclass(frozen=True, slots=True)
+class Criterion:
+    axis: Axis  # which axis's signals this clinician section summarises
+    label: str  # clinician-facing section name
+
+
+@dataclass(frozen=True, slots=True)
 class BriefTemplate:
     name: str  # "Rotterdam" | "Cardiometabolic + mental-health risk"
-    criteria: tuple[str, ...]  # sections the longitudinal memory maps onto
+    criteria: tuple[Criterion, ...]  # each maps an axis's signals onto a clinician section
 
 
 @dataclass(frozen=True, slots=True)

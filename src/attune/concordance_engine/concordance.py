@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from statistics import median
 
-from attune.concordance_engine.memory import Memory
+from attune.concordance_engine.memory import Memory, Signal
 
 MAD_TO_SIGMA = 0.6745  # scales median-absolute-deviation to a normal sigma
+BASELINE_SPAN = 30  # days of personal history used as the baseline
+Z_THRESHOLD = 1.5  # per-axis robust-z past which a signal counts as deviating
 
 
 def robust_z(value: float, history: list[float]) -> float:
@@ -30,6 +32,10 @@ class ConcordanceFinding:
     concordant: bool  # >= 2 axes deviate together — specificity over a single noisy channel
 
 
+def baseline_history(series: list[Signal], before_day: int, span: int = BASELINE_SPAN) -> list[float]:
+    return [s.value for s in series if s.day < before_day][-span:]
+
+
 def deviations(
     mem: Memory, day: int, span: int, baseline_span: int, axis_of: dict[str, str]
 ) -> list[AxisDeviation]:
@@ -42,7 +48,7 @@ def deviations(
             continue
         history = baselines.get(s.key)
         if history is None:
-            history = [h.value for h in mem.series(s.key) if h.day < cutoff][-baseline_span:]
+            history = baseline_history(mem.series(s.key), cutoff, baseline_span)
             baselines[s.key] = history
         per_axis.setdefault(axis, []).append(abs(robust_z(s.value, history)))
     return [AxisDeviation(axis, sum(zs) / len(zs)) for axis, zs in per_axis.items()]
@@ -54,8 +60,8 @@ def concordance(
     axis_of: dict[str, str],
     *,
     span: int = 3,
-    baseline_span: int = 30,
-    z_threshold: float = 1.5,
+    baseline_span: int = BASELINE_SPAN,
+    z_threshold: float = Z_THRESHOLD,
     weights: dict[str, float] | None = None,
 ) -> ConcordanceFinding:
     weights = weights or {}

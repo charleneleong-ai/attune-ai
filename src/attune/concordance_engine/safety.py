@@ -21,6 +21,7 @@ class EscalationContract:
     handoff_targets: tuple[str, ...]  # e.g. ("Samaritans 116 123", "on-call clinician")
     amber_action: str
     red_action: str
+    green_action: str = "within personal baseline — continue monitoring"
 
 
 @dataclass(frozen=True, slots=True)

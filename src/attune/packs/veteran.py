@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from attune.concordance_engine.safety import BASE_RED_KEYWORDS, SAMARITANS, EscalationContract
 from attune.packs.axes import Axis
-from attune.packs.base import BriefTemplate, ConditionPack, Coupling, Persona, SignalSpec
+from attune.packs.base import (
+    BriefTemplate,
+    ConditionPack,
+    Coupling,
+    Criterion,
+    Persona,
+    SignalSpec,
+)
 
 # The generalization proof: PCOS's metabolic spine + a first-class psychological axis
 # coupled to a physiological axis, and a higher-acuity escalation contract. Same engine.
@@ -28,9 +35,9 @@ VETERAN_PACK = ConditionPack(
     brief=BriefTemplate(
         "Cardiometabolic + mental-health risk",
         criteria=(
-            "autonomic load (HRV / resting HR / sleep trend)",
-            "psychological drift (voice affect / engagement)",
-            "cardiometabolic spine (weight / BP)",
+            Criterion(Axis.PHYSIOLOGICAL, "autonomic load — HRV / resting HR / sleep"),
+            Criterion(Axis.PSYCHOLOGICAL, "psychological drift — voice affect / engagement"),
+            Criterion(Axis.METABOLIC, "cardiometabolic spine — weight"),
         ),
     ),
     persona=Persona(

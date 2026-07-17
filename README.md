@@ -40,11 +40,14 @@ concordance_engine/
   memory.py         typed longitudinal Signal store + window/baseline queries
   concordance.py    personal baselines (robust z) + cross-axis concordance
   safety.py         tiered escalation with a DETERMINISTIC crisis floor
-  engine.py         ties memory + pack together; ingest / reflect / assess
+  brief.py          maps memory → BriefTemplate criteria (Rotterdam / cardiometabolic)
+  engine.py         ties memory + pack together; ingest / reflect / assess / brief
 packs/
   base.py           the ConditionPack abstraction (the swappable config surface)
   pcos.py           metabolic-first pack (deep demo)
   veteran.py        mind–body pack (generalization proof)
+reporting.py        presentation layer — render a Brief to clinician markdown
+synth.py            seeded synthetic patients with a planted concordant flare
 ```
 
 **One engine, swappable packs.** Everything condition-specific lives in a `ConditionPack`:
@@ -89,11 +92,11 @@ verdict = eng.assess("rough night, no sleep", day=30)   # Green / Amber / Red
 
 ## Build plan (hackathon)
 
-1. **Engine + packs** (done in scaffold) — memory, concordance, safety, PCOS + veteran packs.
-2. **Seeded patients** — 60–90 day synthetic histories with a *planted* concordant pattern the
-   reflection pass discovers live. Author with GPT-4o, load into `data/`.
+1. ✅ **Engine + packs** — memory, concordance, safety, PCOS + veteran packs.
+2. ✅ **Seeded patients** — deterministic synthetic histories with a *planted* concordant flare
+   the reflection pass discovers live; `attune-seed` writes them to `data/`.
 3. **Capture** — wire `capture/` to Realtime (voice) + GPT-4o vision (skin/meal photos).
-4. **Brief generator** — map memory onto the pack's `BriefTemplate` (Rotterdam / cardiometabolic).
+4. ✅ **Brief generator** — maps memory onto the pack's `BriefTemplate` (Rotterdam / cardiometabolic).
 5. **Demo surface** — voice check-in that remembers → live concordant warning → clinician brief
    → (veteran) scripted red-tier escalation → the PCOS↔veteran config hot-swap.
 

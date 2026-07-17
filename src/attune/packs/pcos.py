@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from attune.concordance_engine.safety import BASE_RED_KEYWORDS, SAMARITANS, EscalationContract
 from attune.packs.axes import Axis
-from attune.packs.base import BriefTemplate, ConditionPack, Coupling, Persona, SignalSpec
+from attune.packs.base import (
+    BriefTemplate,
+    ConditionPack,
+    Coupling,
+    Criterion,
+    Persona,
+    SignalSpec,
+)
 
 # The deep-demo pack: metabolic-first, on eMed's home turf. Mood is present but minor —
 # promoting it to a first-class axis + adding a physiological axis yields the veteran pack.
@@ -26,9 +33,9 @@ PCOS_PACK = ConditionPack(
     brief=BriefTemplate(
         "Rotterdam",
         criteria=(
-            "ovulatory dysfunction (cycle irregularity)",
-            "clinical hyperandrogenism (acne / hirsutism, vision-scored)",
-            "metabolic context (weight / GI trend)",
+            Criterion(Axis.CYCLE, "ovulatory dysfunction — cycle irregularity"),
+            Criterion(Axis.DERMATOLOGICAL, "clinical hyperandrogenism — acne / hirsutism (vision-scored)"),
+            Criterion(Axis.METABOLIC, "metabolic context — weight / GI trend"),
         ),
     ),
     persona=Persona(

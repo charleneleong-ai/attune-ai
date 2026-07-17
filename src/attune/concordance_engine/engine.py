@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from attune.concordance_engine.brief import Brief, build_brief
 from attune.concordance_engine.concordance import ConcordanceFinding, concordance
 from attune.concordance_engine.memory import Memory, Signal
 from attune.concordance_engine.safety import SafetyVerdict, assess
@@ -22,6 +23,9 @@ class Engine:
 
     def reflect(self, day: int) -> ConcordanceFinding:
         return concordance(self.memory, day, self.pack.axis_of, weights=self.pack.axis_weights)
+
+    def brief(self, day: int) -> Brief:
+        return build_brief(self.pack, self.memory, day)
 
     def assess(self, text: str, day: int, *, classifier_flag: bool = False) -> SafetyVerdict:
         finding = self.reflect(day)
