@@ -8,6 +8,8 @@
 
 **Tech Stack:** Python 3.13, Typer, Rich, Pydantic, pytest, existing `attune.concordance_engine`.
 
+**Architecture Diagram:** `docs/diagrams/attunefm-lite-architecture.mmd` is the source Mermaid diagram and is mirrored in `docs/specs/2026-07-17-attunefm-lite-design.md`.
+
 ## Global Constraints
 
 - Save design specs under `docs/specs/`; save implementation plans under `docs/plans/`.
@@ -149,3 +151,31 @@ Expected: output includes wearable, voice, photo, and video check-in channels pl
 Run: `git diff -- README.md docs src tests`
 
 Expected: changes are scoped to AttuneFM-lite docs, pack registration, score adapter, demo channel labels, and tests.
+
+---
+
+### Task 5: Add Project Commands
+
+**Files:**
+- Create: `mise.toml`
+
+**Interfaces:**
+- Produces: `mise run init`
+- Produces: `mise run test`
+- Produces: `mise run demo-attunefm`
+- Produces: `mise run demo-attunefm-profile <profile>`
+
+- [x] **Step 1: Add command surface**
+
+Add `mise.toml` tasks for project init, validation, full demo, AttuneFM-lite demo, and a parameterized profile demo.
+Support targeted AttuneFM profile demos for office work, firefighter/occupational hazard, firefighter with asthma, firefighter post-fire recovery, firefighter with dormant chronic illness, veteran hidden chronic load, autoimmune flare, and metabolic/PCOS scenarios.
+
+- [x] **Step 2: Verify commands**
+
+Run:
+- `mise run demo-attunefm`
+- `mise run demo-attunefm-profile firefighter_recovery`
+- `mise run demo-attunefm-profile veteran`
+- `uv run --extra dev pytest`
+
+Expected: the demos run and the full test suite passes. Prototype model fitting and the A100 training command are split into the follow-up model branch.
