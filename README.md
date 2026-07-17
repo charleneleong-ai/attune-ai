@@ -23,8 +23,13 @@ config pack loaded on top. That's the innovation — and it speaks to what eMed 
   concordance engine, with mood promoted to a first-class **psychological** axis coupled to a
   **physiological** axis (HRV, sleep) — early-warning of a bad week ~2 days out, plus a
   higher-acuity crisis-escalation path.
+- **Foundation-model wedge — AttuneFM-lite** (occupational + chronic-health monitoring): a
+  broad multimodal pack that treats wearables, voice, text, images, and video as first-class
+  monitoring channels for recovery, fatigue, medication/lifestyle response, visible change,
+  mobility change, and clinical summaries.
 
-The last thing the judges see is the mic-drop: *the same code, plus one axis, becomes either.*
+The last thing the judges see is the mic-drop: *the same code becomes condition-specific care
+or a general AttuneFM-lite personal nurse layer by swapping configuration, not engine code.*
 
 ## Why it's novel (couldn't exist 2 years ago)
 
@@ -46,7 +51,9 @@ packs/
   base.py           the ConditionPack abstraction (the swappable config surface)
   pcos.py           metabolic-first pack (deep demo)
   veteran.py        mind–body pack (generalization proof)
+  attunefm.py       occupational/chronic-health multimodal pack
 checkin.py          the daily voice-first check-in routine → typed Signals
+attunefm.py         monitoring scores over the shared longitudinal memory
 reporting.py        presentation layer — render a Brief to clinician markdown
 synth.py            seeded synthetic patients with a planted concordant flare
 ```
@@ -91,6 +98,7 @@ uv venv && uv pip install -e ".[dev]"
 uv run pytest            # concordance + safety + pack + brief + demo logic
 uv run attune-seed       # write seeded patients to data/
 uv run attune-demo       # narrate both packs end-to-end (or: attune-demo veteran)
+uv run attune-demo attunefm  # occupational/chronic-health personal nurse layer
 ```
 
 ```python
@@ -107,12 +115,14 @@ verdict = eng.assess("rough night, no sleep", day=30)   # Green / Amber / Red
 1. ✅ **Engine + packs** — memory, concordance, safety, PCOS + veteran packs.
 2. ✅ **Seeded patients** — deterministic synthetic histories with a *planted* concordant flare
    the reflection pass discovers live; `attune-seed` writes them to `data/`.
-3. **Capture** — the voice-first check-in routine (`checkin.py`) is built + demoable offline;
+3. ✅ **AttuneFM-lite pack** — wearables + voice + text + image + video signals for occupational
+   health, chronic illness, medication/lifestyle response, visible change, and mobility change.
+4. **Capture** — the voice-first check-in routine (`checkin.py`) is built + demoable offline;
    remaining is wiring `capture/` to Realtime (voice) + GPT-4o vision so live answers/photos fill
    the same `record_checkin` responses.
-4. ✅ **Brief generator** — maps memory onto the pack's `BriefTemplate` (Rotterdam / cardiometabolic).
-5. ✅ **Demo surface (offline)** — `attune-demo`: timeline → live concordant warning → clinician
-   brief → AMBER/RED escalation → PCOS↔veteran hot-swap. Capture (step 3) swaps in live signals.
+5. ✅ **Brief generator** — maps memory onto the pack's `BriefTemplate` (Rotterdam / cardiometabolic).
+6. ✅ **Demo surface (offline)** — `attune-demo`: timeline → live concordant warning → clinician
+   brief → AMBER/RED escalation → PCOS↔veteran↔AttuneFM hot-swap. Capture (step 4) swaps in live signals.
 
 ## Feasibility / credits
 

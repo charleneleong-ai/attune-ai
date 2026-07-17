@@ -1,0 +1,26 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run --extra dev ruff check --fix
+        language: system
+        types_or: [python, pyi]
+
+      - id: ruff-format
+        name: ruff format
+        entry: uv run --extra dev ruff format --check
+        language: system
+        types_or: [python, pyi]
+
+      - id: check-toml
+        name: check toml
+        entry: uv run --extra dev python -c "import pathlib, sys, tomllib; [tomllib.loads(pathlib.Path(arg).read_text()) for arg in sys.argv[1:]]"
+        language: system
+        types: [toml]
+
+      - id: check-merge-conflict
+        name: check merge conflict markers
+        entry: uv run --extra dev python -c "import pathlib, sys; markers=('<'*7, '='*7, '>'*7); bad=[]; [bad.append(str(p)) for arg in sys.argv[1:] for p in [pathlib.Path(arg)] if p.is_file() and any(line.startswith(markers) for line in p.read_text(errors='ignore').splitlines())]; print('\n'.join(bad)); sys.exit(bool(bad))"
+        language: system
+        types: [text]
