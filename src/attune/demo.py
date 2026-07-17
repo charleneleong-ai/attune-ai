@@ -13,8 +13,10 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 
+from attune.checkin import record_checkin
 from attune.concordance_engine.concordance import ConcordanceFinding
 from attune.concordance_engine.engine import PACKS, Engine
+from attune.concordance_engine.memory import Memory
 from attune.concordance_engine.safety import Tier
 from attune.packs.base import ConditionPack
 from attune.reporting import render
@@ -37,6 +39,18 @@ def show_timeline(findings: list[ConcordanceFinding]) -> None:
         status = "[red]concordant[/]" if f.concordant else "[green]ok[/]"
         table.add_row(str(f.day), f"{f.load:.1f}", status, ", ".join(f.deviating_axes))
     console.print(table)
+
+
+def show_checkin(pack: ConditionPack, mem: Memory, day: int) -> None:
+    # the patient's spoken answers are that day's actual values (voice fills these live at the venue)
+    day_values = {s.key: s.value for s in mem.window(day, 1)}
+    console.print(f"\n[bold]Daily voice check-in[/] — day {day} (voice-first, photos optional):")
+    for item in pack.checkin:
+        channel = "photo" if item.source == "vision" else "voice"
+        console.print(f'  [dim]agent:[/] "{item.prompt}"  [dim]({channel})[/]')
+        console.print(f"    [italic]patient →[/] {item.signal_key} = {day_values.get(item.signal_key)}")
+    signals = record_checkin(pack, day, day_values)
+    console.print(f"  [green]→ {len(signals)} signals captured[/] and scored against personal baseline")
 
 
 def show_escalation(eng: Engine, day: int) -> None:
@@ -63,8 +77,9 @@ def run_pack(pack: ConditionPack, *, days: int = 90) -> None:
     first = next((f.day for f in findings if f.concordant), None)
     console.print(
         f"[bold]Early warning:[/] first concordant on day {first} "
-        f"(flare onset ~day {window.onset}) — caught as the drift begins.\n"
+        f"(flare onset ~day {window.onset}) — caught as the drift begins."
     )
+    show_checkin(pack, eng.memory, window.midpoint)
     console.print(
         Panel(Markdown(render(eng.brief(window.midpoint))), title="clinician brief", expand=False)
     )

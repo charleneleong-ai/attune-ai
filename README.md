@@ -46,9 +46,19 @@ packs/
   base.py           the ConditionPack abstraction (the swappable config surface)
   pcos.py           metabolic-first pack (deep demo)
   veteran.py        mind–body pack (generalization proof)
+checkin.py          the daily voice-first check-in routine → typed Signals
 reporting.py        presentation layer — render a Brief to clinician markdown
 synth.py            seeded synthetic patients with a planted concordant flare
 ```
+
+### Voice-first daily check-in
+
+The **core channel is voice** — a short daily spoken check-in, tuned to the pack's persona
+register, with optional "show me" photo turns. It's the accessible, low-friction surface for
+patients who aren't digitally native, and low friction is what sustains adherence. The routine
+is pack-declared (`ConditionPack.checkin`); `record_checkin` maps answers to typed `Signal`s.
+Voice (Realtime) and vision (GPT-4o) are the *transports* wired in at capture (step 3) — the
+routine and downstream assessment already exist and are the same engine.
 
 **One engine, swappable packs.** Everything condition-specific lives in a `ConditionPack`:
 signal→axis map, coupling hypotheses (seed the reflection pass), the clinical brief template,
@@ -97,7 +107,9 @@ verdict = eng.assess("rough night, no sleep", day=30)   # Green / Amber / Red
 1. ✅ **Engine + packs** — memory, concordance, safety, PCOS + veteran packs.
 2. ✅ **Seeded patients** — deterministic synthetic histories with a *planted* concordant flare
    the reflection pass discovers live; `attune-seed` writes them to `data/`.
-3. **Capture** — wire `capture/` to Realtime (voice) + GPT-4o vision (skin/meal photos).
+3. **Capture** — the voice-first check-in routine (`checkin.py`) is built + demoable offline;
+   remaining is wiring `capture/` to Realtime (voice) + GPT-4o vision so live answers/photos fill
+   the same `record_checkin` responses.
 4. ✅ **Brief generator** — maps memory onto the pack's `BriefTemplate` (Rotterdam / cardiometabolic).
 5. ✅ **Demo surface (offline)** — `attune-demo`: timeline → live concordant warning → clinician
    brief → AMBER/RED escalation → PCOS↔veteran hot-swap. Capture (step 3) swaps in live signals.

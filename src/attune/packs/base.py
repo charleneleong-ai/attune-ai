@@ -45,6 +45,14 @@ class Persona:
 
 
 @dataclass(frozen=True, slots=True)
+class CheckinItem:
+    signal_key: str  # the Signal this turn elicits; must match a SignalSpec.key on the pack
+    prompt: str  # the spoken question, in the pack's persona register
+    source: str = "self_report"  # how this turn captures the value: self_report | audio | vision
+    optional: bool = False  # optional "show me" visual / skippable turn — voice stays the floor
+
+
+@dataclass(frozen=True, slots=True)
 class ConditionPack:
     name: str
     signals: tuple[SignalSpec, ...]
@@ -52,7 +60,16 @@ class ConditionPack:
     brief: BriefTemplate
     persona: Persona
     escalation: EscalationContract
+    checkin: tuple[CheckinItem, ...] = ()  # the daily voice-first routine
     axis_weights: dict[Axis, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        declared = {s.key for s in self.signals}
+        for item in self.checkin:
+            if item.signal_key not in declared:
+                raise ValueError(
+                    f"pack '{self.name}': check-in item '{item.signal_key}' is not a declared signal"
+                )
 
     @property
     def axis_of(self) -> dict[str, Axis]:

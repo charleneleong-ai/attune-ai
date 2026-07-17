@@ -4,6 +4,7 @@ from attune.concordance_engine.safety import BASE_RED_KEYWORDS, SAMARITANS, Esca
 from attune.packs.axes import Axis
 from attune.packs.base import (
     BriefTemplate,
+    CheckinItem,
     ConditionPack,
     Coupling,
     Criterion,
@@ -49,6 +50,11 @@ VETERAN_PACK = ConditionPack(
         handoff_targets=("on-call clinician", SAMARITANS, "veterans' crisis line"),
         amber_action="increase support + draft clinician brief; propose grounding",
         red_action="pause management, de-escalation script, warm human handoff",
+    ),
+    checkin=(
+        CheckinItem("sleep_hours", "How many hours did you actually get last night?"),
+        CheckinItem("mood_valence", "Where's your head at today?"),
+        CheckinItem("voice_affect", "How's the week landing on you?", source="audio"),
     ),
     axis_weights={Axis.PSYCHOLOGICAL: 1.5, Axis.PHYSIOLOGICAL: 1.5, Axis.METABOLIC: 1.0},
 )
