@@ -1,0 +1,35 @@
+[tools]
+python = "3.13"
+uv = "latest"
+
+[tasks.init]
+description = "Install project dependencies and register pre-commit hooks."
+run = """
+uv sync --extra dev
+uv run pre-commit install
+"""
+
+[tasks.test]
+description = "Run branch-scoped pre-commit checks plus the full test suite."
+run = """
+uv run --extra dev pre-commit run --from-ref origin/main --to-ref HEAD
+uv run --extra dev pytest
+"""
+
+[tasks.demo]
+description = "Run the full Attune demo across registered packs."
+run = "uv run attune-demo"
+
+[tasks.demo-attunefm]
+description = "Run the AttuneFM-lite occupational/chronic-health demo."
+run = "uv run attune-demo attunefm"
+
+[tasks.demo-attunefm-profile]
+description = "Run one named AttuneFM-lite demo profile."
+usage = '''
+arg "<profile>" {
+  help "AttuneFM profile to run"
+  choices "office" "firefighter" "firefighter_asthma" "firefighter_recovery" "firefighter_dormant" "veteran" "autoimmune" "metabolic_pcos"
+}
+'''
+run = 'uv run attune-demo attunefm --profile "${usage_profile?}"'

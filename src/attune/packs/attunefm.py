@@ -81,6 +81,22 @@ ATTUNEFM_PACK = ConditionPack(
             "work_burden", Axis.BEHAVIORAL, "text", normal=0.35, noise=0.08, flare=+0.45
         ),
         SignalSpec(
+            "pain_interference",
+            Axis.PAIN,
+            "self_report",
+            normal=0.12,
+            noise=0.05,
+            flare=+0.55,
+        ),
+        SignalSpec(
+            "cognitive_fog",
+            Axis.COGNITIVE,
+            "self_report",
+            normal=0.14,
+            noise=0.05,
+            flare=+0.48,
+        ),
+        SignalSpec(
             "engagement", Axis.BEHAVIORAL, "text", normal=0.9, noise=0.08, flare=-0.4
         ),
         SignalSpec(
@@ -118,19 +134,20 @@ ATTUNEFM_PACK = ConditionPack(
     ),
     couplings=(
         Coupling(
-            ("sleep_hours", "hrv", "voice_fatigue", "work_burden"),
+            ("sleep_hours", "hrv", "voice_fatigue", "work_burden", "cognitive_fog"),
             lag_days=2,
-            description="workload and poor sleep precede recovery and fatigue deterioration",
+            description="workload and poor sleep precede recovery, fatigue, and brain-fog deterioration",
         ),
         Coupling(
             (
                 "medication_tolerance",
                 "resting_hr",
+                "pain_interference",
                 "skin_wound_change",
                 "mobility_change",
             ),
             lag_days=1,
-            description="medication or lifestyle changes align with visible and functional change",
+            description="medication or lifestyle changes align with pain, visible, and functional change",
         ),
     ),
     brief=BriefTemplate(
@@ -140,6 +157,8 @@ ATTUNEFM_PACK = ConditionPack(
             Criterion(Axis.PSYCHOLOGICAL, "voice and symptom burden"),
             Criterion(Axis.METABOLIC, "diet, glucose, and medication response"),
             Criterion(Axis.BEHAVIORAL, "work pattern and functional capacity"),
+            Criterion(Axis.PAIN, "pain interference and flare burden"),
+            Criterion(Axis.COGNITIVE, "brain fog, focus, and cognitive fatigue"),
             Criterion(Axis.DERMATOLOGICAL, "visible skin, wound, or swelling change"),
         ),
     ),
@@ -163,6 +182,13 @@ ATTUNEFM_PACK = ConditionPack(
         ),
         CheckinItem("work_burden", "How heavy does today's work or life load feel?"),
         CheckinItem(
+            "pain_interference",
+            "Is pain getting in the way of work, movement, or rest today?",
+        ),
+        CheckinItem(
+            "cognitive_fog", "How clear or foggy does your thinking feel today?"
+        ),
+        CheckinItem(
             "skin_wound_change",
             "Want to show me any rash, swelling, wound, or skin change?",
             source="vision",
@@ -180,6 +206,8 @@ ATTUNEFM_PACK = ConditionPack(
         Axis.PSYCHOLOGICAL: 1.2,
         Axis.METABOLIC: 1.1,
         Axis.BEHAVIORAL: 1.0,
+        Axis.PAIN: 1.0,
+        Axis.COGNITIVE: 0.9,
         Axis.DERMATOLOGICAL: 0.8,
     },
 )

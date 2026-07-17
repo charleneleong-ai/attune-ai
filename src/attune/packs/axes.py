@@ -12,3 +12,5 @@ class Axis(StrEnum):
     PSYCHOLOGICAL = "psychological"
     PHYSIOLOGICAL = "physiological"
     BEHAVIORAL = "behavioral"
+    PAIN = "pain"
+    COGNITIVE = "cognitive"

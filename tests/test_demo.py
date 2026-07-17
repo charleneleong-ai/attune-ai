@@ -1,5 +1,10 @@
 from attune.concordance_engine.engine import Engine
-from attune.demo import channel_label, first_concordant_day
+from attune.demo import (
+    attunefm_profile_names,
+    channel_label,
+    demo_checkin_answer,
+    first_concordant_day,
+)
 from attune.packs.veteran import VETERAN_PACK
 from attune.synth import flare_window, generate
 
@@ -24,3 +29,24 @@ def test_channel_label_keeps_image_and_video_distinct():
     assert channel_label("video") == "video"
     assert channel_label("audio") == "voice"
     assert channel_label("self_report") == "voice"
+
+
+def test_demo_checkin_answer_turns_scores_into_patient_language():
+    assert "wiped out" in demo_checkin_answer("voice_fatigue", 1.01)
+    assert "Pain is getting in the way" in demo_checkin_answer("pain_interference", 0.9)
+    assert "foggy" in demo_checkin_answer("cognitive_fog", 0.7)
+    assert "upload a photo" in demo_checkin_answer("skin_wound_change", 0.21)
+    assert "movement video" in demo_checkin_answer("mobility_change", 0.7)
+
+
+def test_attunefm_demo_profiles_cover_work_hazard_and_chronic_illness():
+    assert attunefm_profile_names() == (
+        "office",
+        "firefighter",
+        "firefighter_asthma",
+        "firefighter_recovery",
+        "firefighter_dormant",
+        "veteran",
+        "autoimmune",
+        "metabolic_pcos",
+    )
