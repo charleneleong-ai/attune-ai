@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from statistics import median
 
 from attune.concordance_engine.concordance import (
-    Z_THRESHOLD,
     baseline_history,
     concordance,
     robust_z,
@@ -34,10 +33,7 @@ class CriterionEvidence:
     axis: str
     label: str
     signals: list[SignalEvidence]
-
-    @property
-    def salient(self) -> bool:
-        return any(abs(e.z) >= Z_THRESHOLD for e in self.signals)
+    salient: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,19 +53,31 @@ def signal_evidence(mem: Memory, key: str, day: int) -> SignalEvidence | None:
     latest = upto[-1].value
     past = baseline_history(upto, day)
     baseline = median(past) if past else latest
-    return SignalEvidence(key, latest, round(baseline, 2), round(robust_z(latest, past), 2))
+    return SignalEvidence(
+        key, latest, round(baseline, 2), round(robust_z(latest, past), 2)
+    )
 
 
 def build_brief(pack: ConditionPack, mem: Memory, day: int) -> Brief:
     axis_of = pack.axis_of
+    finding = concordance(mem, day, axis_of, weights=pack.axis_weights)
+    deviating_axes = set(finding.deviating_axes)
     criteria: list[CriterionEvidence] = []
     for crit in pack.brief.criteria:
         keys = [k for k, axis in axis_of.items() if axis == crit.axis]
         evidence = [e for k in keys if (e := signal_evidence(mem, k, day)) is not None]
-        criteria.append(CriterionEvidence(crit.axis, crit.label, evidence))
-    finding = concordance(mem, day, axis_of, weights=pack.axis_weights)
+        criteria.append(
+            CriterionEvidence(
+                crit.axis,
+                crit.label,
+                evidence,
+                salient=crit.axis in deviating_axes,
+            )
+        )
     recommendation = (
-        pack.escalation.amber_action if finding.concordant else pack.escalation.green_action
+        pack.escalation.amber_action
+        if finding.concordant
+        else pack.escalation.green_action
     )
     return Brief(
         pack.brief.name,
