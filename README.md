@@ -1,4 +1,4 @@
-# Attune
+# Attune AI
 
 **A condition-agnostic concordance engine for at-home chronic condition management.**
 
