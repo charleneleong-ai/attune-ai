@@ -29,12 +29,23 @@ CRISIS_UTTERANCE = "honestly some days I feel like I want to end it"
 TIER_COLOR = {Tier.GREEN: "green", Tier.AMBER: "yellow", Tier.RED: "red"}
 
 
+def channel_label(source: str) -> str:
+    return {
+        "audio": "voice",
+        "self_report": "voice",
+        "vision": "photo",
+        "video": "video",
+    }.get(source, source)
+
+
 def first_concordant_day(eng: Engine, lo: int, hi: int) -> int | None:
     return next((day for day in range(lo, hi + 1) if eng.reflect(day).concordant), None)
 
 
 def show_timeline(findings: list[ConcordanceFinding]) -> None:
-    table = Table("day", "load", "status", "axes over threshold", title="daily concordance")
+    table = Table(
+        "day", "load", "status", "axes over threshold", title="daily concordance"
+    )
     for f in findings:
         status = "[red]concordant[/]" if f.concordant else "[green]ok[/]"
         table.add_row(str(f.day), f"{f.load:.1f}", status, ", ".join(f.deviating_axes))
@@ -44,13 +55,19 @@ def show_timeline(findings: list[ConcordanceFinding]) -> None:
 def show_checkin(pack: ConditionPack, mem: Memory, day: int) -> None:
     # the patient's spoken answers are that day's actual values (voice fills these live at the venue)
     day_values = {s.key: s.value for s in mem.window(day, 1)}
-    console.print(f"\n[bold]Daily voice check-in[/] — day {day} (voice-first, photos optional):")
+    console.print(
+        f"\n[bold]Daily voice check-in[/] — day {day} (voice-first, photos/videos optional):"
+    )
     for item in pack.checkin:
-        channel = "photo" if item.source == "vision" else "voice"
+        channel = channel_label(item.source)
         console.print(f'  [dim]agent:[/] "{item.prompt}"  [dim]({channel})[/]')
-        console.print(f"    [italic]patient →[/] {item.signal_key} = {day_values.get(item.signal_key)}")
+        console.print(
+            f"    [italic]patient →[/] {item.signal_key} = {day_values.get(item.signal_key)}"
+        )
     signals = record_checkin(pack, day, day_values)
-    console.print(f"  [green]→ {len(signals)} signals captured[/] and scored against personal baseline")
+    console.print(
+        f"  [green]→ {len(signals)} signals captured[/] and scored against personal baseline"
+    )
 
 
 def show_escalation(eng: Engine, day: int) -> None:
@@ -63,7 +80,9 @@ def show_escalation(eng: Engine, day: int) -> None:
             f"({verdict.triggered_by}) — {verdict.reason}"
         )
         if verdict.tier is Tier.RED:
-            console.print(f"    → warm handoff: {', '.join(eng.pack.escalation.handoff_targets)}")
+            console.print(
+                f"    → warm handoff: {', '.join(eng.pack.escalation.handoff_targets)}"
+            )
 
 
 def run_pack(pack: ConditionPack, *, days: int = 90) -> None:
@@ -81,7 +100,11 @@ def run_pack(pack: ConditionPack, *, days: int = 90) -> None:
     )
     show_checkin(pack, eng.memory, window.midpoint)
     console.print(
-        Panel(Markdown(render(eng.brief(window.midpoint))), title="clinician brief", expand=False)
+        Panel(
+            Markdown(render(eng.brief(window.midpoint))),
+            title="clinician brief",
+            expand=False,
+        )
     )
     show_escalation(eng, window.midpoint)
 
@@ -101,7 +124,10 @@ def main(
             console.rule("[dim]same engine — hot-swapping the condition pack[/]")
     if len(names) > 1:
         console.print(
-            Panel("One concordance engine. Two conditions. Config, not code.", title="the thesis")
+            Panel(
+                "One concordance engine. Two conditions. Config, not code.",
+                title="the thesis",
+            )
         )
 
 
