@@ -11,3 +11,5 @@ build/
 .DS_Store
 data/*.json
 !data/.gitkeep
+runs/
+wandb/
