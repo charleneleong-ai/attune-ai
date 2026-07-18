@@ -17,15 +17,34 @@ import yaml
 from rich.console import Console
 from rich.table import Table
 
-from attune.attunefm import ModelFeatures, featurize_memory, monitoring_scores
+from attune.attunefm import (
+    FEATURE_WINDOW,
+    featurize_memory,
+    monitoring_scores,
+    series_by_day,
+    window_feature_keys,
+    window_features,
+)
+from attune.concordance_engine.concordance import BASELINE_SPAN
 from attune.concordance_engine.engine import Engine, PACKS
 from attune.concordance_engine.memory import Memory
 from attune.datasets import DATASET_CATALOG, DEMO_DATASET_NAMES, DatasetStub
-from attune.synth import ATTUNEFM_PROFILES, PatientProfile, flare_window, generate
+from attune.synth import (
+    ACTIVE_PERIODS,
+    ATTUNEFM_PROFILES,
+    PatientProfile,
+    day_period,
+    flare_window,
+    flare_windows,
+    generate,
+)
 
 console = Console()
 CONFIG_DIR = Path("configs")
 CHECKIN_LOG_LIMIT = 512
+EXAMPLE_LOG_LIMIT = 400  # per split; an all-day dataset is thousands of rows
+HEATMAP_ROW_LIMIT = 120  # per split; keeps the rendered PNG a readable height
+MEMORY_CACHE: dict[tuple[str, int, int], Memory] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +73,7 @@ class TrainingConfig:
     weight_decay: float = (
         0.0  # L2 penalty; the linear head overfits 120 examples without it
     )
+    feature_window: int = FEATURE_WINDOW  # trailing days summarised per signal
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +188,7 @@ def _load_training_config_file(name: str) -> TrainingConfig:
         ),
         output_dir=Path(raw.get("output_dir", f"runs/attunefm-{config_name}")),
         weight_decay=float(raw.get("weight_decay", 0.0)),
+        feature_window=int(raw.get("feature_window", FEATURE_WINDOW)),
     )
 
 
@@ -247,33 +268,18 @@ def _profile_variant(profile: PatientProfile, seed_offset: int) -> PatientProfil
     return replace(profile, seed=profile.seed + seed_offset)
 
 
-def _features(pack_name: str, memory: Memory, *, day: int) -> ModelFeatures:
-    return featurize_memory(PACKS[pack_name], memory, day=day)
+def patient_memory(config: TrainingConfig, variant: PatientProfile) -> Memory:
+    # generate() is a pure function of (pack, days, profile variant), but four consumers each
+    # rebuilt the same timelines — ~69% of the calls were redundant.
+    cached = MEMORY_CACHE.get((config.pack, config.days, variant.seed))
+    if cached is None:
+        cached = generate(PACKS[config.pack], days=config.days, profile=variant)
+        MEMORY_CACHE[(config.pack, config.days, variant.seed)] = cached
+    return cached
 
 
 def _signal_keys(pack_name: str) -> tuple[str, ...]:
     return tuple(spec.key for spec in PACKS[pack_name].signals)
-
-
-def _feature_keys(pack_name: str) -> tuple[str, ...]:
-    signal_keys = _signal_keys(pack_name)
-    return (*signal_keys, *(f"value_{key}" for key in signal_keys))
-
-
-def _latest_value(memory: Memory, key: str, day: int) -> float:
-    series = [signal for signal in memory.series(key) if signal.day <= day]
-    return series[-1].value if series else 0.0
-
-
-def _vector(
-    feature_keys: tuple[str, ...], features: ModelFeatures, memory: Memory, *, day: int
-) -> tuple[float, ...]:
-    return tuple(
-        _latest_value(memory, key.removeprefix("value_"), day)
-        if key.startswith("value_")
-        else features.signal_z.get(key, 0.0)
-        for key in feature_keys
-    )
 
 
 def _temporal_periods(days: int) -> tuple[tuple[str, int], ...]:
@@ -360,13 +366,13 @@ def _checkin_records(config: TrainingConfig) -> tuple[CheckinRecord, ...]:
     records = []
     seed_offsets = (*config.train_seed_offsets, *config.eval_seed_offsets)
     pack = PACKS[config.pack]
+    checkin_keys = tuple(item.signal_key for item in pack.checkin)
     for profile_name, profile in ATTUNEFM_PROFILES.items():
         for seed_offset in seed_offsets:
-            memory = generate(
-                pack,
-                days=config.days,
-                profile=_profile_variant(profile, seed_offset),
-            )
+            memory = patient_memory(config, _profile_variant(profile, seed_offset))
+            # One dense pass instead of re-scanning the memory for every (day, prompt) — this
+            # loop was the single biggest cost in a run.
+            values = series_by_day(memory, checkin_keys, config.days)
             for day in range(config.days):
                 for item in pack.checkin:
                     missing_reason = _missing_reason(
@@ -377,11 +383,7 @@ def _checkin_records(config: TrainingConfig) -> tuple[CheckinRecord, ...]:
                         optional=item.optional,
                     )
                     answered = missing_reason == ""
-                    value = (
-                        _latest_value(memory, item.signal_key, day)
-                        if answered
-                        else None
-                    )
+                    value = values[item.signal_key][day] if answered else None
                     capture_modality = _capture_modality(item.source)
                     records.append(
                         CheckinRecord(
@@ -414,15 +416,10 @@ def _checkin_records(config: TrainingConfig) -> tuple[CheckinRecord, ...]:
 def _write_source_signal_records(config: TrainingConfig, path: Path) -> int:
     count = 0
     seed_offsets = (*config.train_seed_offsets, *config.eval_seed_offsets)
-    pack = PACKS[config.pack]
     with path.open("w") as file:
         for profile_name, profile in ATTUNEFM_PROFILES.items():
             for seed_offset in seed_offsets:
-                memory = generate(
-                    pack,
-                    days=config.days,
-                    profile=_profile_variant(profile, seed_offset),
-                )
+                memory = patient_memory(config, _profile_variant(profile, seed_offset))
                 for signal in sorted(
                     memory.signals, key=lambda item: (item.day, item.key, item.source)
                 ):
@@ -454,28 +451,28 @@ def _write_checkin_records(path: Path, records: tuple[CheckinRecord, ...]) -> No
 def _examples(
     config: TrainingConfig, seed_offsets: tuple[int, ...]
 ) -> tuple[TrainingExample, ...]:
-    feature_keys = _feature_keys(config.pack)
-    temporal_periods = _temporal_periods(config.days)
+    # Every day of the timeline, not a handful of landmark days: the generator produces a full
+    # year per patient and sampling 5 days threw away ~99% of it.
+    signal_keys = _signal_keys(config.pack)
+    first_day = max(BASELINE_SPAN, config.feature_window)
     examples = []
     for profile_name, profile in ATTUNEFM_PROFILES.items():
         for seed_offset in seed_offsets:
-            memory = generate(
-                PACKS[config.pack],
-                days=config.days,
-                profile=_profile_variant(profile, seed_offset),
-            )
-            for period, day in temporal_periods:
+            variant = _profile_variant(profile, seed_offset)
+            memory = patient_memory(config, variant)
+            # Episode timing is patient-specific, so day labels come from this patient's own
+            # episodes rather than one shared window.
+            windows = flare_windows(config.days, seed=variant.seed)
+            values = series_by_day(memory, signal_keys, config.days)
+            for day in range(first_day, config.days):
                 examples.append(
                     TrainingExample(
                         profile=profile_name,
                         seed_offset=seed_offset,
                         day=day,
-                        period=period,
-                        features=_vector(
-                            feature_keys,
-                            _features(config.pack, memory, day=day),
-                            memory,
-                            day=day,
+                        period=day_period(day, windows),
+                        features=window_features(
+                            values, signal_keys, day=day, window=config.feature_window
                         ),
                     )
                 )
@@ -495,7 +492,10 @@ def _mean_scale(
         variance = sum((example.features[i] - mean) ** 2 for example in examples) / len(
             examples
         )
-        scales.append(max(variance**0.5, 1.0))
+        # Guard against divide-by-zero only. Flooring at 1.0 would leave every sub-unit-variance
+        # signal (spo2, valence, breathlessness, voice_fatigue) effectively unstandardized, so the
+        # head learns to ignore them — that alone cost ~half the single-day accuracy.
+        scales.append(max(variance**0.5, 1e-6))
     return means, tuple(scales)
 
 
@@ -595,18 +595,6 @@ def _accuracy(
     return correct / len(examples)
 
 
-def _active_periods(days: int) -> frozenset[str]:
-    # "active" = temporal periods that fall inside the planted flare window. Baseline days
-    # (pre_flare/recovery) carry no condition signal, so identifying a profile there is
-    # underdetermined — the blended accuracy is dragged down by them, not by the model.
-    window = flare_window(days)
-    return frozenset(
-        period
-        for period, day in _temporal_periods(days)
-        if window.onset <= day < window.end
-    )
-
-
 def _accuracy_by_period(
     examples: tuple[TrainingExample, ...],
     labels: tuple[str, ...],
@@ -649,18 +637,19 @@ def _profile_eval(
     scales: tuple[float, ...],
 ) -> tuple[ProfileEval, ...]:
     day = flare_window(config.days).midpoint
-    feature_keys = _feature_keys(config.pack)
+    signal_keys = _signal_keys(config.pack)
     evaluations = []
     for profile_name, profile in ATTUNEFM_PROFILES.items():
-        memory = generate(
-            PACKS[config.pack],
-            days=config.days,
-            profile=_profile_variant(profile, config.eval_seed_offsets[0]),
+        memory = patient_memory(
+            config, _profile_variant(profile, config.eval_seed_offsets[0])
         )
         engine = Engine(PACKS[config.pack], memory)
-        features = _features(config.pack, memory, day=day)
+        features = featurize_memory(PACKS[config.pack], memory, day=day)
+        values = series_by_day(memory, signal_keys, config.days)
         x = _standardize(
-            _vector(feature_keys, features, memory, day=day), means, scales
+            window_features(values, signal_keys, day=day, window=config.feature_window),
+            means,
+            scales,
         )
         probs = _predict_proba(x, weights, bias)
         predicted_index = max(range(len(labels)), key=probs.__getitem__)
@@ -696,6 +685,28 @@ def _wandb_config(config: TrainingConfig) -> dict[str, object]:
     }
 
 
+def _sample_examples(
+    examples: tuple[TrainingExample, ...], *, limit: int = EXAMPLE_LOG_LIMIT
+) -> tuple[TrainingExample, ...]:
+    # An all-day dataset is thousands of rows and mostly baseline days. Keep every non-baseline
+    # day (rare and the interesting ones) and evenly sample baseline to fill the budget, so the
+    # logged table and heatmap stay small without ever dropping a flare.
+    notable = tuple(item for item in examples if item.period != "baseline")
+    baseline = tuple(item for item in examples if item.period == "baseline")
+    if len(notable) >= limit:
+        return _even_sample(notable, limit=limit)
+    return (*notable, *_even_sample(baseline, limit=limit - len(notable)))
+
+
+def _even_sample(items: tuple, *, limit: int) -> tuple:
+    if limit <= 0:
+        return ()
+    if len(items) <= limit:
+        return items
+    step = (len(items) - 1) / (limit - 1) if limit > 1 else 0.0
+    return tuple(items[round(index * step)] for index in range(limit))
+
+
 def _wandb_examples_table(wandb, run: TrainingRun):
     columns = [
         "split",
@@ -708,8 +719,8 @@ def _wandb_examples_table(wandb, run: TrainingRun):
     ]
     rows = []
     for split, examples in (
-        ("train", run.train_examples),
-        ("eval", run.eval_examples),
+        ("train", _sample_examples(run.train_examples)),
+        ("eval", _sample_examples(run.eval_examples)),
     ):
         for index, example in enumerate(examples):
             rows.append(
@@ -836,7 +847,10 @@ def _heat_color(value: float) -> bytes:
 
 def _write_feature_heatmap(run: TrainingRun) -> Path:
     cell_size = 8
-    examples = (*run.train_examples, *run.eval_examples)
+    examples = (
+        *_sample_examples(run.train_examples, limit=HEATMAP_ROW_LIMIT),
+        *_sample_examples(run.eval_examples, limit=HEATMAP_ROW_LIMIT),
+    )
     width = max(1, len(run.signal_keys) * cell_size)
     height = max(1, len(examples) * cell_size)
     rows = []
@@ -961,7 +975,7 @@ def train_attunefm_lite(
     )
     train_accuracy = _accuracy(train_examples, labels, weights, bias, means, scales)
     eval_accuracy = _accuracy(eval_examples, labels, weights, bias, means, scales)
-    active = _active_periods(config.days)
+    active = ACTIVE_PERIODS
     train_active_accuracy = _active_accuracy(
         train_examples, labels, weights, bias, means, scales, active=active
     )
@@ -994,7 +1008,7 @@ def train_attunefm_lite(
             for period, day in _temporal_periods(config.days)
         ],
         "labels": labels,
-        "signal_keys": _feature_keys(config.pack),
+        "signal_keys": window_feature_keys(PACKS[config.pack]),
         "feature_mean": means,
         "feature_scale": scales,
         "weights": weights,
@@ -1008,7 +1022,7 @@ def train_attunefm_lite(
             "final_loss": final_loss,
             "train_examples": len(train_examples),
             "eval_examples": len(eval_examples),
-            "feature_columns": len(_feature_keys(config.pack)),
+            "feature_columns": len(window_feature_keys(PACKS[config.pack])),
             "source_signal_records": source_signal_records,
             "checkin_records": len(checkin_records),
             "checkin_captured_records": sum(
@@ -1022,7 +1036,7 @@ def train_attunefm_lite(
     checkpoint_path.write_text(json.dumps(checkpoint, indent=2))
     run = TrainingRun(
         config=config,
-        signal_keys=_feature_keys(config.pack),
+        signal_keys=window_feature_keys(PACKS[config.pack]),
         train_examples=train_examples,
         eval_examples=eval_examples,
         checkin_records=checkin_records,

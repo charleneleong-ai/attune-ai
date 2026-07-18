@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import exp, sqrt
+from math import exp, fsum, sqrt
 
-from attune.concordance_engine.concordance import baseline_history, robust_z
+from statistics import fmean
+
+from attune.concordance_engine.concordance import (
+    BASELINE_SPAN,
+    baseline_history,
+    robust_z,
+)
 from attune.concordance_engine.engine import Engine
 from attune.concordance_engine.memory import Memory
 from attune.datasets import DatasetStub, datasets_for_modality
 from attune.packs.base import ConditionPack
 from attune.packs.axes import Axis
+
+FEATURE_WINDOW = 30  # default trailing days summarised per signal
 
 
 SOURCE_MODALITIES = {
@@ -160,6 +168,62 @@ def _feature_vector(
     signal_keys: tuple[str, ...], features: ModelFeatures
 ) -> tuple[float, ...]:
     return tuple(features.signal_z.get(key, 0.0) for key in signal_keys)
+
+
+def window_feature_keys(pack: ConditionPack) -> tuple[str, ...]:
+    """Column names for the trained head's feature vector, in vector order."""
+    keys = tuple(spec.key for spec in pack.signals)
+    return (
+        *keys,  # |robust z| against the personal baseline
+        *(f"value_{key}" for key in keys),  # latest raw value
+        *(f"mean_{key}" for key in keys),  # trailing-window mean
+        *(f"std_{key}" for key in keys),  # trailing-window volatility
+    )
+
+
+def series_by_day(
+    memory: Memory, signal_keys: tuple[str, ...], days: int
+) -> dict[str, list[float]]:
+    """Dense per-signal day arrays — one pass, so per-day lookups stop rescanning the memory."""
+    values = {key: [0.0] * days for key in signal_keys}
+    for signal in memory.signals:
+        if signal.key in values and 0 <= signal.day < days:
+            values[signal.key][signal.day] = signal.value
+    return values
+
+
+def population_stdev(values: list[float], mean: float) -> float:
+    # statistics.pstdev works in exact Fraction arithmetic and costs ~11x this at our call volume.
+    if len(values) < 2:
+        return 0.0
+    return sqrt(fsum((value - mean) ** 2 for value in values) / len(values))
+
+
+def window_features(
+    values: dict[str, list[float]],
+    signal_keys: tuple[str, ...],
+    *,
+    day: int,
+    window: int = FEATURE_WINDOW,
+) -> tuple[float, ...]:
+    """The trained head's features for one day.
+
+    A patient's baseline offset is stable but noisy day to day, so summarising a trailing window
+    cuts that noise ~sqrt(window) — which is what makes a profile identifiable on a quiet day and
+    not just during a flare.
+    """
+    z_scores, latest, means, deviations = [], [], [], []
+    for key in signal_keys:
+        series = values[key]
+        current = series[day]
+        history = series[max(0, day - BASELINE_SPAN) : day]
+        trailing = series[max(0, day - window) : day + 1]
+        mean = fmean(trailing)
+        z_scores.append(abs(robust_z(current, history)))
+        latest.append(current)
+        means.append(mean)
+        deviations.append(population_stdev(trailing, mean))
+    return (*z_scores, *latest, *means, *deviations)
 
 
 def _distance(left: tuple[float, ...], right: tuple[float, ...]) -> float:
