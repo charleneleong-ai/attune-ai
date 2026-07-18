@@ -154,28 +154,51 @@ Expected: changes are scoped to AttuneFM-lite docs, pack registration, score ada
 
 ---
 
-### Task 5: Add Project Commands
+### Task 5: Add Project Commands And Training
 
 **Files:**
 - Create: `mise.toml`
+- Create: `src/attune/training.py`
+- Modify: `pyproject.toml`
+- Test: `tests/test_training.py`
 
 **Interfaces:**
+- Produces: `attune-train-plan`
+- Produces: `attune-train`
+- Produces: default W&B logging with `--no-wandb` opt-out
 - Produces: `mise run init`
 - Produces: `mise run test`
 - Produces: `mise run demo-attunefm`
 - Produces: `mise run demo-attunefm-profile <profile>`
+- Produces: `mise run train-attunefm-plan <config>`
+- Produces: `mise run train-attunefm <config>`
 
 - [x] **Step 1: Add command surface**
 
-Add `mise.toml` tasks for project init, validation, full demo, AttuneFM-lite demo, and a parameterized profile demo.
+Add `mise.toml` tasks for project init, validation, full demo, AttuneFM-lite demo, a parameterized profile demo, parameterized training-plan configs, local smoke training, and the A100 training target over BIDSleep, WESAD, CGMacros, Bridge2AI-Voice, DDI, and PAMAP2.
 Support targeted AttuneFM profile demos for office work, firefighter/occupational hazard, firefighter with asthma, firefighter post-fire recovery, firefighter with dormant chronic illness, veteran hidden chronic load, autoimmune flare, and metabolic/PCOS scenarios.
 
-- [x] **Step 2: Verify commands**
+- [x] **Step 2: Add training-plan CLI**
+
+Add `attune-train-plan` as a dry-run command that validates dataset names against `attune.datasets` and prints modalities, heads, and staged training intent.
+
+- [x] **Step 3: Add real training CLI**
+
+Add `attune-train` as a real local trainer that fits a lightweight multiclass classifier over deterministic AttuneFM profile memories and writes a JSON checkpoint with metrics. Training configs are flat YAML files under `configs/*.yaml`, including `debug`, `smoke`, `one_year`, `a100_train`, and `a100_full`. The generated profile timelines now include explicit daily check-in exchanges, so the local one-year config schedules 81,760 voice/photo/video prompts, captures 58,330 synthetic patient responses, and marks 23,430 realistic missed/skipped turns alongside 198,560 sensor-like signal rows. `a100_train` is the default one-year A100 target, with 397,120 sensor rows and 163,520 scheduled check-in turns.
+
+- [x] **Step 4: Add optional experiment tracking**
+
+Add local `.env` loading, a safe `.env.example`, and default-on W&B logging for training config, metrics, per-profile confidence, compact input-example and multimodal check-in exchange tables, plots, input-feature heatmap images, checkpoint path, full source-signal/check-in JSONL artifact paths, and run URL output. Real secrets stay in `.env`, which is gitignored; `--no-wandb` opts out for local runs.
+
+- [x] **Step 5: Verify commands**
 
 Run:
 - `mise run demo-attunefm`
 - `mise run demo-attunefm-profile firefighter_recovery`
 - `mise run demo-attunefm-profile veteran`
+- `mise run train-attunefm-plan smoke`
+- `mise run train-attunefm smoke`
+- `mise run train-attunefm-plan a100_train`
 - `uv run --extra dev pytest`
 
-Expected: the demos run and the full test suite passes. Prototype model fitting and the A100 training command are split into the follow-up model branch.
+Expected: the demo runs, the training plan prints the selected public datasets, the real smoke trainer writes a checkpoint, and the full test suite passes.

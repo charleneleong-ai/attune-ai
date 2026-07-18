@@ -33,3 +33,35 @@ arg "<profile>" {
 }
 '''
 run = 'uv run attune-demo attunefm --profile "${usage_profile?}"'
+
+[tasks.train-attunefm-plan]
+description = "Show an AttuneFM training plan for a named config."
+usage = '''
+arg "<config>" {
+  help "Training config name or YAML path to plan"
+}
+'''
+run = """
+uv run attune-train-plan --config "${usage_config?}"
+"""
+
+[tasks.train-attunefm]
+description = "Run real AttuneFM training for a named config and write a checkpoint under runs/."
+usage = '''
+arg "<config>" {
+  help "Training config name or YAML path to run"
+}
+'''
+run = """
+uv run attune-train \
+  --config "${usage_config?}" \
+  --output-dir "runs/attunefm-${usage_config?}"
+"""
+
+[tasks.train-attunefm-example]
+description = "Alias for local real AttuneFM smoke training."
+run = """
+uv run attune-train \
+  --config smoke \
+  --output-dir runs/attunefm-smoke
+"""
