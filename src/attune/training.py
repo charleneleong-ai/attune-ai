@@ -74,6 +74,10 @@ class TrainingConfig:
         0.0  # L2 penalty; the linear head overfits 120 examples without it
     )
     feature_window: int = FEATURE_WINDOW  # trailing days summarised per signal
+    forecast_horizons: tuple[int, ...] = (
+        7,
+        30,
+    )  # days ahead for episode-onset forecasting
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +87,9 @@ class TrainingExample:
     day: int
     period: str
     features: tuple[float, ...]
+    forecast: tuple[
+        int, ...
+    ] = ()  # 1 per horizon: an episode onsets within that many days
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +129,7 @@ class TrainingRun:
     train_active_accuracy: float
     eval_active_accuracy: float
     eval_accuracy_by_period: dict[str, float]
+    forecast_metrics: dict[int, dict[str, float]]
     final_loss: float
     checkpoint_path: Path
     source_signal_path: Path
@@ -189,6 +197,9 @@ def _load_training_config_file(name: str) -> TrainingConfig:
         output_dir=Path(raw.get("output_dir", f"runs/attunefm-{config_name}")),
         weight_decay=float(raw.get("weight_decay", 0.0)),
         feature_window=int(raw.get("feature_window", FEATURE_WINDOW)),
+        forecast_horizons=_tuple_ints(
+            raw.get("forecast_horizons", (7, 30)), field="forecast_horizons"
+        ),
     )
 
 
@@ -463,6 +474,7 @@ def _examples(
             # Episode timing is patient-specific, so day labels come from this patient's own
             # episodes rather than one shared window.
             windows = flare_windows(config.days, seed=variant.seed)
+            onsets = tuple(window.onset for window in windows)
             values = series_by_day(memory, signal_keys, config.days)
             for day in range(first_day, config.days):
                 examples.append(
@@ -474,9 +486,20 @@ def _examples(
                         features=window_features(
                             values, signal_keys, day=day, window=config.feature_window
                         ),
+                        forecast=_forecast_label(day, onsets, config.forecast_horizons),
                     )
                 )
     return tuple(examples)
+
+
+def _forecast_label(
+    day: int, onsets: tuple[int, ...], horizons: tuple[int, ...]
+) -> tuple[int, ...]:
+    # 1 where an episode onset falls in the next `horizon` days — the early-warning target.
+    return tuple(
+        int(any(day < onset <= day + horizon for onset in onsets))
+        for horizon in horizons
+    )
 
 
 def _mean_scale(
@@ -628,6 +651,92 @@ def _active_accuracy(
     return _accuracy(subset, labels, weights, bias, means, scales) if subset else 0.0
 
 
+def _feature_matrix(
+    examples: tuple[TrainingExample, ...],
+    means: tuple[float, ...],
+    scales: tuple[float, ...],
+    device: str,
+) -> torch.Tensor:
+    return torch.tensor(
+        [_standardize(example.features, means, scales) for example in examples],
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def _binary_auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    positives = labels.sum().item()
+    negatives = labels.numel() - positives
+    if positives == 0 or negatives == 0:
+        return 0.5  # undefined without both classes; report chance
+    order = torch.argsort(scores)
+    ranked = labels[order]
+    ranks = torch.arange(1, labels.numel() + 1, dtype=torch.float32)
+    rank_sum = ranks[ranked == 1].sum().item()
+    return (rank_sum - positives * (positives + 1) / 2) / (positives * negatives)
+
+
+def _forecast_head(
+    train_examples: tuple[TrainingExample, ...],
+    eval_examples: tuple[TrainingExample, ...],
+    horizons: tuple[int, ...],
+    means: tuple[float, ...],
+    scales: tuple[float, ...],
+    *,
+    epochs: int,
+    learning_rate: float,
+    weight_decay: float,
+    device: str,
+) -> tuple[list[list[float]], list[float], dict[int, dict[str, float]]]:
+    # One shared head with a sigmoid output per horizon (multi-label): "does an episode start
+    # within h days?" Rare positives at short horizons, so weight the loss by class balance.
+    features = _feature_matrix(train_examples, means, scales, device)
+    targets = torch.tensor(
+        [example.forecast for example in train_examples],
+        dtype=torch.float32,
+        device=device,
+    )
+    base_rate = targets.mean(dim=0).clamp(1e-6, 1 - 1e-6)
+    torch.manual_seed(0)
+    head = torch.nn.Linear(features.shape[1], len(horizons)).to(device)
+    optimizer = torch.optim.Adam(
+        head.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=(1 - base_rate) / base_rate)
+    for _ in range(epochs):
+        optimizer.zero_grad()
+        loss_fn(head(features), targets).backward()
+        optimizer.step()
+
+    eval_features = _feature_matrix(eval_examples, means, scales, device)
+    eval_targets = torch.tensor(
+        [example.forecast for example in eval_examples],
+        dtype=torch.float32,
+        device=device,
+    )
+    with torch.no_grad():
+        probabilities = torch.sigmoid(head(eval_features))
+    metrics: dict[int, dict[str, float]] = {}
+    for index, horizon in enumerate(horizons):
+        scores = probabilities[:, index]
+        labels = eval_targets[:, index]
+        predicted = scores >= 0.5
+        true_positive = (predicted & (labels == 1)).sum().item()
+        false_positive = (predicted & (labels == 0)).sum().item()
+        false_negative = ((~predicted) & (labels == 1)).sum().item()
+        metrics[horizon] = {
+            "base_rate": labels.mean().item(),
+            "auc": _binary_auc(scores, labels),
+            "precision": true_positive / max(true_positive + false_positive, 1),
+            "recall": true_positive / max(true_positive + false_negative, 1),
+        }
+    return (
+        head.weight.detach().cpu().tolist(),
+        head.bias.detach().cpu().tolist(),
+        metrics,
+    )
+
+
 def _profile_eval(
     config: TrainingConfig,
     labels: tuple[str, ...],
@@ -762,6 +871,32 @@ def _wandb_input_split_table(wandb, run: TrainingRun):
     )
 
 
+def _wandb_forecast_table(wandb, run: TrainingRun):
+    return wandb.Table(
+        columns=["horizon", "auc", "precision", "recall", "base_rate"],
+        data=[
+            [
+                f"{horizon}d",
+                scores["auc"],
+                scores["precision"],
+                scores["recall"],
+                scores["base_rate"],
+            ]
+            for horizon, scores in sorted(run.forecast_metrics.items())
+        ],
+    )
+
+
+def _wandb_period_accuracy_table(wandb, run: TrainingRun):
+    return wandb.Table(
+        columns=["period", "eval_accuracy"],
+        data=[
+            [period, accuracy]
+            for period, accuracy in sorted(run.eval_accuracy_by_period.items())
+        ],
+    )
+
+
 def _sample_checkin_records(
     records: tuple[CheckinRecord, ...], *, limit: int = CHECKIN_LOG_LIMIT
 ) -> tuple[CheckinRecord, ...]:
@@ -892,6 +1027,8 @@ def _log_wandb(run: TrainingRun) -> str | None:
             {
                 "train/accuracy": run.train_accuracy,
                 "eval/accuracy": run.eval_accuracy,
+                "eval/active_accuracy": run.eval_active_accuracy,
+                "train/active_accuracy": run.train_active_accuracy,
                 "train/final_loss": run.final_loss,
                 "train/epochs": run.config.epochs,
                 "train/examples": len(run.train_examples),
@@ -905,13 +1042,19 @@ def _log_wandb(run: TrainingRun) -> str | None:
                 "train/checkin_missing_records": sum(
                     not record.answered for record in run.checkin_records
                 ),
-                "train/temporal_periods": len(_temporal_periods(run.config.days)),
+                "train/day_types": len({e.period for e in run.train_examples}),
+                **{
+                    f"forecast/auc_{horizon}d": scores["auc"]
+                    for horizon, scores in run.forecast_metrics.items()
+                },
             }
         )
         wandb_run.log({"training/input_examples": _wandb_examples_table(wandb, run)})
         wandb_run.log({"training/checkin_examples": _wandb_checkin_table(wandb, run)})
         profile_table = _wandb_profile_confidence_table(wandb, run)
         split_table = _wandb_input_split_table(wandb, run)
+        forecast_table = _wandb_forecast_table(wandb, run)
+        period_table = _wandb_period_accuracy_table(wandb, run)
         heatmap_path = _write_feature_heatmap(run)
         wandb_run.log(
             {
@@ -926,6 +1069,18 @@ def _log_wandb(run: TrainingRun) -> str | None:
                     "split",
                     "examples",
                     title="Input examples by split",
+                ),
+                "plots/forecast_auc": wandb.plot.bar(
+                    forecast_table,
+                    "horizon",
+                    "auc",
+                    title="Episode-forecast AUC by horizon",
+                ),
+                "plots/eval_accuracy_by_period": wandb.plot.bar(
+                    period_table,
+                    "period",
+                    "eval_accuracy",
+                    title="Diagnosis accuracy by day type",
                 ),
                 "images/input_feature_heatmap": wandb.Image(
                     str(heatmap_path),
@@ -966,12 +1121,14 @@ def train_attunefm_lite(
     train_examples = _examples(config, config.train_seed_offsets)
     eval_examples = _examples(config, config.eval_seed_offsets)
     checkin_records = _checkin_records(config)
+    device = _select_device(config.accelerator)
     weights, bias, means, scales, final_loss = _train_linear_classifier(
         train_examples,
         labels,
         epochs=config.epochs,
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
+        device=device,
     )
     train_accuracy = _accuracy(train_examples, labels, weights, bias, means, scales)
     eval_accuracy = _accuracy(eval_examples, labels, weights, bias, means, scales)
@@ -984,6 +1141,17 @@ def train_attunefm_lite(
     )
     eval_accuracy_by_period = _accuracy_by_period(
         eval_examples, labels, weights, bias, means, scales
+    )
+    forecast_weights, forecast_bias, forecast_metrics = _forecast_head(
+        train_examples,
+        eval_examples,
+        config.forecast_horizons,
+        means,
+        scales,
+        epochs=config.epochs,
+        learning_rate=config.learning_rate,
+        weight_decay=config.weight_decay,
+        device=device,
     )
     evaluations = _profile_eval(config, labels, weights, bias, means, scales)
 
@@ -1013,12 +1181,18 @@ def train_attunefm_lite(
         "feature_scale": scales,
         "weights": weights,
         "bias": bias,
+        "forecast_weights": forecast_weights,
+        "forecast_bias": forecast_bias,
+        "forecast_horizons": list(config.forecast_horizons),
         "metrics": {
             "train_accuracy": train_accuracy,
             "eval_accuracy": eval_accuracy,
             "train_active_accuracy": train_active_accuracy,
             "eval_active_accuracy": eval_active_accuracy,
             "eval_accuracy_by_period": eval_accuracy_by_period,
+            "forecast": {
+                str(horizon): scores for horizon, scores in forecast_metrics.items()
+            },
             "final_loss": final_loss,
             "train_examples": len(train_examples),
             "eval_examples": len(eval_examples),
@@ -1045,6 +1219,7 @@ def train_attunefm_lite(
         train_active_accuracy=train_active_accuracy,
         eval_active_accuracy=eval_active_accuracy,
         eval_accuracy_by_period=eval_accuracy_by_period,
+        forecast_metrics=forecast_metrics,
         final_loss=final_loss,
         checkpoint_path=checkpoint_path,
         source_signal_path=source_signal_path,
@@ -1101,14 +1276,17 @@ def _render_run(run: TrainingRun) -> None:
         f"{sum(record.answered for record in run.checkin_records):,} responses "
         f"/ {sum(not record.answered for record in run.checkin_records):,} missed"
     )
+    period_count = len({example.period for example in run.train_examples})
     console.print(
         "[bold]Temporal examples:[/] "
         f"{len(run.train_examples):,} train / {len(run.eval_examples):,} eval "
-        f"across {len(_temporal_periods(run.config.days))} periods"
+        f"across {period_count} day types"
     )
     console.print(f"[bold]Feature columns:[/] {len(run.signal_keys)}")
-    console.print(f"[bold]Train accuracy:[/] {run.train_accuracy:.0%}")
-    console.print(f"[bold]Eval accuracy:[/] {run.eval_accuracy:.0%}")
+    console.print(
+        f"[bold]Diagnosis eval accuracy:[/] {run.eval_accuracy:.0%} "
+        f"(active/drift days {run.eval_active_accuracy:.0%})"
+    )
     console.print(f"[bold]Final loss:[/] {run.final_loss:.3f}")
     console.print(f"[bold]Checkpoint:[/] {run.checkpoint_path}")
     console.print(f"[bold]Source signal data:[/] {run.source_signal_path}")
@@ -1128,6 +1306,19 @@ def _render_run(run: TrainingRun) -> None:
             ", ".join(item.top_drivers),
         )
     console.print(eval_table)
+
+    forecast_table = Table(
+        "episode forecast", "base rate", "AUC", "precision", "recall"
+    )
+    for horizon, scores in sorted(run.forecast_metrics.items()):
+        forecast_table.add_row(
+            f"within {horizon}d",
+            f"{scores['base_rate']:.0%}",
+            f"{scores['auc']:.3f}",
+            f"{scores['precision']:.2f}",
+            f"{scores['recall']:.2f}",
+        )
+    console.print(forecast_table)
 
 
 def main(

@@ -302,6 +302,22 @@ def test_one_year_checkins_cover_profiles_and_realistic_missing_days(tmp_path):
     )
 
 
+def test_forecast_heads_learn_episode_onset_ahead_of_time(tmp_path):
+    config = build_training_config("one_year", output_dir=tmp_path, epochs=300)
+    run = train_attunefm_lite(config, wandb_enabled=False)
+
+    assert tuple(run.forecast_metrics) == config.forecast_horizons
+    for horizon, scores in run.forecast_metrics.items():
+        # a relapsing episode within `horizon` days is genuinely predictable from the trailing
+        # window — well above the 0.5 chance AUC, but not a saturated 1.0
+        assert 0.65 < scores["auc"] < 0.95, (horizon, scores["auc"])
+        assert 0.0 <= scores["base_rate"] <= 1.0
+    checkpoint = json.loads(run.checkpoint_path.read_text())
+    assert set(checkpoint["metrics"]["forecast"]) == {
+        str(horizon) for horizon in config.forecast_horizons
+    }
+
+
 def test_train_attunefm_lite_logs_to_wandb_when_enabled(tmp_path, monkeypatch):
     events = []
     tables = []
@@ -422,14 +438,22 @@ def test_train_attunefm_lite_logs_to_wandb_when_enabled(tmp_path, monkeypatch):
     assert (
         visual_payload["plots/input_split_counts"]["title"] == "Input examples by split"
     )
+    assert (
+        visual_payload["plots/forecast_auc"]["title"]
+        == "Episode-forecast AUC by horizon"
+    )
+    assert (
+        visual_payload["plots/eval_accuracy_by_period"]["title"]
+        == "Diagnosis accuracy by day type"
+    )
     heatmap = visual_payload["images/input_feature_heatmap"]
     assert heatmap.caption == "AttuneFM input feature z-score heatmap"
     assert Path(heatmap.path).read_bytes().startswith(b"\x89PNG")
     assert input_table in tables
     assert checkin_table in tables
-    assert len(tables) == 4
+    assert len(tables) == 6
     assert len(images) == 1
-    assert len(plots) == 2
+    assert len(plots) == 4
 
 
 def test_train_attunefm_lite_logs_to_wandb_by_default(tmp_path, monkeypatch):
