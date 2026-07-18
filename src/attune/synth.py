@@ -263,6 +263,17 @@ ACTIVE_PERIODS = frozenset({"flare_onset", "flare_peak", "flare_late", "flare"})
 PERIOD_NAMES = (*sorted(ACTIVE_PERIODS), "pre_flare", "recovery", "baseline")
 
 
+def episode_onset_within(
+    day: int, windows: tuple[FlareWindow, ...], horizons: tuple[int, ...]
+) -> tuple[int, ...]:
+    """1 per horizon: an episode onset falls within that many days after `day` (forecast target)."""
+    onsets = [window.onset for window in windows]
+    return tuple(
+        int(any(day < onset <= day + horizon for onset in onsets))
+        for horizon in horizons
+    )
+
+
 def day_period(day: int, windows: tuple[FlareWindow, ...]) -> str:
     """Label a day against every planted episode, not just the last one."""
     for window in windows:

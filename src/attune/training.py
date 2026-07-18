@@ -34,6 +34,7 @@ from attune.synth import (
     ATTUNEFM_PROFILES,
     PatientProfile,
     day_period,
+    episode_onset_within,
     flare_window,
     flare_windows,
     generate,
@@ -293,24 +294,6 @@ def _signal_keys(pack_name: str) -> tuple[str, ...]:
     return tuple(spec.key for spec in PACKS[pack_name].signals)
 
 
-def _temporal_periods(days: int) -> tuple[tuple[str, int], ...]:
-    window = flare_window(days)
-    candidates = (
-        ("pre_flare", max(30, window.onset - 2)),
-        ("flare_onset", window.onset),
-        ("flare_peak", window.midpoint),
-        ("flare_late", window.end - 1),
-        ("recovery", min(days - 1, window.end + 3)),
-    )
-    seen: set[int] = set()
-    periods = []
-    for period, day in candidates:
-        if day not in seen:
-            seen.add(day)
-            periods.append((period, day))
-    return tuple(periods)
-
-
 def _source_signal_records(config: TrainingConfig) -> int:
     seed_count = len(config.train_seed_offsets) + len(config.eval_seed_offsets)
     return (
@@ -474,7 +457,6 @@ def _examples(
             # Episode timing is patient-specific, so day labels come from this patient's own
             # episodes rather than one shared window.
             windows = flare_windows(config.days, seed=variant.seed)
-            onsets = tuple(window.onset for window in windows)
             values = series_by_day(memory, signal_keys, config.days)
             for day in range(first_day, config.days):
                 examples.append(
@@ -486,20 +468,12 @@ def _examples(
                         features=window_features(
                             values, signal_keys, day=day, window=config.feature_window
                         ),
-                        forecast=_forecast_label(day, onsets, config.forecast_horizons),
+                        forecast=episode_onset_within(
+                            day, windows, config.forecast_horizons
+                        ),
                     )
                 )
     return tuple(examples)
-
-
-def _forecast_label(
-    day: int, onsets: tuple[int, ...], horizons: tuple[int, ...]
-) -> tuple[int, ...]:
-    # 1 where an episode onset falls in the next `horizon` days — the early-warning target.
-    return tuple(
-        int(any(day < onset <= day + horizon for onset in onsets))
-        for horizon in horizons
-    )
 
 
 def _mean_scale(
@@ -572,11 +546,7 @@ def _train_linear_classifier(
     # stays framework-free — the sequence encoder ("AttuneFM proper") swaps in behind this shape.
     means, scales = _mean_scale(examples)
     label_index = {label: i for i, label in enumerate(labels)}
-    features = torch.tensor(
-        [_standardize(example.features, means, scales) for example in examples],
-        dtype=torch.float32,
-        device=device,
-    )
+    features = _feature_matrix(examples, means, scales, device)
     targets = torch.tensor(
         [label_index[example.profile] for example in examples],
         dtype=torch.long,
@@ -787,10 +757,6 @@ def _wandb_config(config: TrainingConfig) -> dict[str, object]:
         "dataset_names": list(config.dataset_names),
         "train_seed_offsets": list(config.train_seed_offsets),
         "eval_seed_offsets": list(config.eval_seed_offsets),
-        "temporal_periods": [
-            {"period": period, "day": day}
-            for period, day in _temporal_periods(config.days)
-        ],
     }
 
 
@@ -1171,10 +1137,7 @@ def train_attunefm_lite(
             "source_signal_records_path": str(source_signal_path),
             "checkin_records_path": str(checkin_path),
         },
-        "temporal_periods": [
-            {"period": period, "day": day}
-            for period, day in _temporal_periods(config.days)
-        ],
+        "day_types": sorted({example.period for example in train_examples}),
         "labels": labels,
         "signal_keys": window_feature_keys(PACKS[config.pack]),
         "feature_mean": means,
