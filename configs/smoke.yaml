@@ -1,0 +1,17 @@
+name: smoke
+pack: attunefm
+dataset_names:
+  - BIDSleep
+  - Bridge2AI-Voice
+  - CGMacros
+  - DDI
+  - PAMAP2
+  - WESAD
+accelerator: cpu
+max_hours: 1
+days: 90
+epochs: 80
+learning_rate: 0.08
+train_seed_offsets: [0, 11, 22]
+eval_seed_offsets: [101]
+output_dir: runs/attunefm-smoke

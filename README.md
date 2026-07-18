@@ -205,7 +205,53 @@ mise run demo-attunefm-profile firefighter_recovery
 mise run demo-attunefm-profile firefighter_asthma
 mise run demo-attunefm-profile veteran
 mise run demo-attunefm-profile metabolic_pcos
+mise run train-attunefm-plan debug
+mise run train-attunefm-plan smoke
+mise run train-attunefm smoke
+mise run train-attunefm-plan one_year
+mise run train-attunefm one_year
+mise run train-attunefm-plan a100_train
+mise run train-attunefm a100_train
+mise run train-attunefm configs/one_year.yaml
 ```
+
+Training configs live in `configs/*.yaml`:
+
+| config | days | generated sensor rows | scheduled check-ins | captured responses | missed/skipped | train windows | eval windows | epochs | target |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `debug` | 90 | 24,480 | 10,080 | 7,232 | 2,848 | 40 | 40 | 20 | local sanity check |
+| `smoke` | 90 | 48,960 | 20,160 | 14,457 | 5,703 | 120 | 40 | 80 | local hackathon default |
+| `one_year` | 365 | 198,560 | 81,760 | 58,330 | 23,430 | 120 | 40 | 800 | local one-year timeline |
+| `a100_train` | 365 | 397,120 | 163,520 | 116,459 | 47,061 | 240 | 80 | 320 | A100 one-year target |
+| `a100_full` | 365 | 794,240 | 327,040 | 233,189 | 93,851 | 480 | 160 | 640 | larger A100 one-year target |
+
+The generated rows are daily multimodal sensor-like records across 8 profiles. Wearable
+channels are HRV, resting heart rate, sleep hours, SpO2, and glucose variability; voice,
+self-report, image, text, and video channels add fatigue, breathlessness, medication
+tolerance, work burden, pain, cognitive fog, skin/wound change, food-photo risk, mobility,
+and posture. Simulated check-in turns replay the pack's daily voice/photo/video exchange
+against each personalized timeline, with deterministic missed days, skipped core turns,
+and lower adherence for optional photo/video uploads. Training windows sample pre-flare,
+flare onset, flare peak, flare late, and recovery periods from each personal timeline.
+
+W&B logging is on by default; use `--no-wandb` for local runs without W&B:
+
+```bash
+cp .env.example .env        # then fill WANDB_API_KEY / WANDB_ENTITY locally
+uv run attune-train --config smoke
+uv run attune-train --config smoke --no-wandb
+```
+
+Training runs log metrics, profile-confidence and split-count plots, checkpoint path, a
+compact `training/input_examples` table with train/eval split, profile label, seed offset,
+and feature columns, a compact `training/checkin_examples` table with prompt/source/value
+rows, answer status, missing reason, capture modality, and synthetic patient response,
+plus an input-feature heatmap image.
+
+Each run also writes the full generated data under its output directory:
+`attunefm-lite-<config>-source-signals.jsonl` contains all generated sensor-like signal
+rows, and `attunefm-lite-<config>-checkins.jsonl` contains the scheduled/captured/missed
+voice/photo/video exchange rows. The checkpoint links both artifact paths.
 
 ```python
 from attune import load, Signal, Axis

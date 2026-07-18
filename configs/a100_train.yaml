@@ -1,0 +1,18 @@
+name: a100_train
+pack: attunefm
+dataset_names:
+  - BIDSleep
+  - Bridge2AI-Voice
+  - CGMacros
+  - DDI
+  - PAMAP2
+  - WESAD
+accelerator: a100-80gb
+max_hours: 6
+days: 365
+epochs: 320
+learning_rate: 0.05
+weight_decay: 0.02
+train_seed_offsets: [0, 7, 14, 21, 28, 35]
+eval_seed_offsets: [101, 151]
+output_dir: runs/attunefm-a100
