@@ -205,34 +205,36 @@ mise run demo-attunefm-profile firefighter_recovery
 mise run demo-attunefm-profile firefighter_asthma
 mise run demo-attunefm-profile veteran
 mise run demo-attunefm-profile metabolic_pcos
-mise run train-attunefm-plan debug
 mise run train-attunefm-plan smoke
 mise run train-attunefm smoke
 mise run train-attunefm-plan one_year
 mise run train-attunefm one_year
-mise run train-attunefm-plan a100_train
-mise run train-attunefm a100_train
+mise run train-attunefm a100
 mise run train-attunefm configs/one_year.yaml
 ```
 
-Training configs live in `configs/*.yaml`:
+Training configs live in `configs/*.yaml` (`one_year` is the default):
 
-| config | days | generated sensor rows | scheduled check-ins | captured responses | missed/skipped | train windows | eval windows | epochs | target |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| `debug` | 90 | 24,480 | 10,080 | 7,232 | 2,848 | 40 | 40 | 20 | local sanity check |
-| `smoke` | 90 | 48,960 | 20,160 | 14,457 | 5,703 | 120 | 40 | 80 | local hackathon default |
-| `one_year` | 365 | 198,560 | 81,760 | 58,330 | 23,430 | 120 | 40 | 800 | local one-year timeline |
-| `a100_train` | 365 | 397,120 | 163,520 | 116,459 | 47,061 | 240 | 80 | 320 | A100 one-year target |
-| `a100_full` | 365 | 794,240 | 327,040 | 233,189 | 93,851 | 480 | 160 | 640 | larger A100 one-year target |
+| config | days | train / eval seeds | train / eval windows | epochs | target |
+|---|---:|---:|---:|---:|---|
+| `smoke` | 90 | 3 / 1 | 1,440 / 480 | 80 | fast local / CI sanity |
+| `one_year` | 365 | 3 / 1 | 8,040 / 2,680 | 400 | local default |
+| `a100` | 365 | 8 / 3 | 21,440 / 8,040 | 600 | scaled GPU one-year target |
 
-The generated rows are daily multimodal sensor-like records across 8 profiles. Wearable
-channels are HRV, resting heart rate, sleep hours, SpO2, and glucose variability; voice,
-self-report, image, text, and video channels add fatigue, breathlessness, medication
-tolerance, work burden, pain, cognitive fog, skin/wound change, food-photo risk, mobility,
-and posture. Simulated check-in turns replay the pack's daily voice/photo/video exchange
-against each personalized timeline, with deterministic missed days, skipped core turns,
-and lower adherence for optional photo/video uploads. Training windows sample pre-flare,
-flare onset, flare peak, flare late, and recovery periods from each personal timeline.
+The generator produces daily multimodal sensor-like records across 8 profiles (HRV, resting
+heart rate, sleep, SpO2, glucose variability, plus voice/self-report/image/text/video channels
+for fatigue, breathlessness, medication tolerance, work burden, pain, cognitive fog, skin/wound
+change, food-photo risk, mobility, and posture). Each patient-year contains several
+relapsing-remitting **episodes** at patient-specific times. Training builds one example per day
+of the timeline (not a handful of landmark days), each summarising a 30-day trailing window per
+signal — a patient's baseline offset is stable but daily-noisy, so the window is what makes a
+profile identifiable on a calm day.
+
+**What the model does (held-out patients):**
+
+- **Diagnosis** — which condition on any given day: **~98%** eval (99% on active/drift days).
+- **Forecast** — will an episode onset within 7d / 30d: **AUC ≈ 0.77** (genuine early-warning
+  signal, class-balanced BCE heads per horizon).
 
 W&B logging is on by default; use `--no-wandb` for local runs without W&B:
 

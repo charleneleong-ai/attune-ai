@@ -1,4 +1,4 @@
-name: a100_train
+name: a100
 pack: attunefm
 dataset_names:
   - BIDSleep
@@ -8,11 +8,11 @@ dataset_names:
   - PAMAP2
   - WESAD
 accelerator: a100-80gb
-max_hours: 6
+max_hours: 10
 days: 365
-epochs: 320
+epochs: 600
 learning_rate: 0.05
 weight_decay: 0.02
-train_seed_offsets: [0, 7, 14, 21, 28, 35]
-eval_seed_offsets: [101, 151]
+train_seed_offsets: [0, 7, 14, 21, 28, 35, 42, 49]
+eval_seed_offsets: [101, 151, 201]
 output_dir: runs/attunefm-a100

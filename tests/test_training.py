@@ -39,30 +39,20 @@ def test_training_plan_validates_and_summarizes_public_datasets():
 
 
 def test_training_config_presets_separate_smoke_and_a100_targets():
-    debug = build_training_config("debug")
     smoke = build_training_config("smoke")
     one_year = build_training_config("one_year")
-    a100 = build_training_config("a100_train")
-    a100_full = build_training_config("a100_full")
+    a100 = build_training_config("a100")
 
-    assert debug.name == "debug"
-    assert debug.epochs < smoke.epochs
-    assert len(debug.train_seed_offsets) < len(smoke.train_seed_offsets)
+    # smoke: fast local CI sanity; one_year: the local default; a100: the scaled GPU target
     assert smoke.name == "smoke"
     assert smoke.accelerator == "cpu"
     assert one_year.name == "one_year"
     assert one_year.days == 365
     assert one_year.epochs > smoke.epochs
-    assert smoke.epochs < a100.epochs
-    assert a100.name == "a100_train"
+    assert a100.name == "a100"
     assert a100.accelerator == "a100-80gb"
-    assert a100.days == one_year.days
-    assert a100.max_hours == 6
-    assert len(a100.train_seed_offsets) > len(smoke.train_seed_offsets)
-    assert a100_full.name == "a100_full"
-    assert a100_full.days >= a100.days
-    assert a100_full.epochs > a100.epochs
-    assert len(a100_full.train_seed_offsets) > len(a100.train_seed_offsets)
+    assert a100.days == one_year.days  # a full year of data on the GPU target too
+    assert len(a100.train_seed_offsets) > len(one_year.train_seed_offsets)
 
 
 def test_training_config_loads_from_yaml_path():

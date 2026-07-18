@@ -1109,7 +1109,7 @@ def _log_wandb(run: TrainingRun) -> str | None:
 def train_attunefm_lite(
     config: TrainingConfig | None = None, *, wandb_enabled: bool | None = None
 ) -> TrainingRun:
-    config = config or build_training_config("smoke")
+    config = config or build_training_config("one_year")
     load_env()
     build_training_plan(
         pack=config.pack,
@@ -1323,8 +1323,8 @@ def _render_run(run: TrainingRun) -> None:
 
 def main(
     config: str = typer.Option(
-        "smoke",
-        help="Training config preset: debug | smoke | one_year | a100_train | a100_full.",
+        "one_year",
+        help="Training config preset: smoke | one_year | a100.",
     ),
     pack: str | None = typer.Option(None, help="Condition pack override."),
     datasets: str = typer.Option(
@@ -1362,8 +1362,8 @@ def main(
 
 def train_main(
     config: str = typer.Option(
-        "smoke",
-        help="Training config preset: debug | smoke | one_year | a100_train | a100_full.",
+        "one_year",
+        help="Training config preset: smoke | one_year | a100.",
     ),
     output_dir: Path | None = typer.Option(None, help="Checkpoint output directory."),
     epochs: int | None = typer.Option(
