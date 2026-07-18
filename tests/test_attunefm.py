@@ -1,5 +1,7 @@
 from attune.attunefm import (
+    AttuneFMLiteModel,
     dataset_grounding,
+    featurize_memory,
     monitoring_answer,
     monitoring_scores,
     modality_coverage,
@@ -86,6 +88,36 @@ def test_all_attunefm_profiles_include_current_demo_dataset_grounding():
         scores = monitoring_scores(engine, day=day)
 
         assert set(DEMO_DATASET_NAMES).issubset(scores.grounding_datasets)
+
+
+def test_attunefm_lite_model_fits_and_predicts_demo_profiles():
+    pack = PACKS["attunefm"]
+    day = flare_window(90).midpoint
+    examples = {
+        profile: generate(pack, days=90, profile=profile)
+        for profile in ATTUNEFM_PROFILES
+    }
+
+    model = AttuneFMLiteModel.fit(pack, examples, day=day)
+
+    assert model.signal_keys == tuple(spec.key for spec in pack.signals)
+    for profile, memory in examples.items():
+        prediction = model.predict(Engine(pack, memory), day=day)
+        assert prediction.profile == profile
+        assert prediction.profile_scores[profile] > 0.0
+        assert prediction.axis_risks
+        assert prediction.task_scores.top_drivers
+
+
+def test_attunefm_featurizer_surfaces_profile_specific_signal_drift():
+    pack = PACKS["attunefm"]
+    day = flare_window(90).midpoint
+    features = featurize_memory(
+        pack, generate(pack, days=90, profile="metabolic_pcos"), day=day
+    )
+
+    assert features.signal_z["diet_response"] > 5.0
+    assert features.axis_loads["metabolic"] > 5.0
 
 
 def test_monitoring_answer_aligns_recommendation_with_scores_and_drivers():

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import exp, sqrt
 
 from attune.concordance_engine.concordance import baseline_history, robust_z
 from attune.concordance_engine.engine import Engine
 from attune.concordance_engine.memory import Memory
 from attune.datasets import DatasetStub, datasets_for_modality
+from attune.packs.base import ConditionPack
 from attune.packs.axes import Axis
 
 
@@ -37,6 +39,63 @@ class MonitoringAnswer:
     stats: tuple[str, ...]
     interpretation: str
     recommendation: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelFeatures:
+    signal_z: dict[str, float]
+    axis_loads: dict[str, float]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelPrediction:
+    profile: str
+    profile_scores: dict[str, float]
+    axis_risks: dict[str, float]
+    task_scores: MonitoringScores
+
+
+@dataclass(frozen=True, slots=True)
+class AttuneFMLiteModel:
+    signal_keys: tuple[str, ...]
+    profile_centroids: dict[str, tuple[float, ...]]
+
+    @classmethod
+    def fit(
+        cls,
+        pack: ConditionPack,
+        examples: dict[str, Memory],
+        *,
+        day: int,
+    ) -> "AttuneFMLiteModel":
+        signal_keys = tuple(spec.key for spec in pack.signals)
+        centroids = {
+            profile: _feature_vector(
+                signal_keys, featurize_memory(pack, memory, day=day)
+            )
+            for profile, memory in examples.items()
+        }
+        return cls(signal_keys=signal_keys, profile_centroids=centroids)
+
+    def predict(self, engine: Engine, *, day: int) -> ModelPrediction:
+        features = featurize_memory(engine.pack, engine.memory, day=day)
+        vector = _feature_vector(self.signal_keys, features)
+        distances = {
+            profile: _distance(vector, centroid)
+            for profile, centroid in self.profile_centroids.items()
+        }
+        profile_scores = _distance_scores(distances)
+        predicted_profile = max(profile_scores, key=profile_scores.get)
+        axis_risks = {
+            axis: _clip01(load / 6.0)
+            for axis, load in sorted(features.axis_loads.items())
+        }
+        return ModelPrediction(
+            profile=predicted_profile,
+            profile_scores=profile_scores,
+            axis_risks=axis_risks,
+            task_scores=monitoring_scores(engine, day=day),
+        )
 
 
 def _clip01(value: float) -> float:
@@ -79,6 +138,40 @@ def _signal_z(memory: Memory, key: str, day: int) -> float:
     latest = current[-1]
     history = baseline_history(series, latest.day)
     return robust_z(latest.value, history)
+
+
+def featurize_memory(pack: ConditionPack, memory: Memory, *, day: int) -> ModelFeatures:
+    signal_z = {
+        spec.key: abs(_signal_z(memory, spec.key, day))
+        for spec in pack.signals
+        if memory.series(spec.key)
+    }
+    axis_values: dict[str, list[float]] = {}
+    for spec in pack.signals:
+        if spec.key in signal_z:
+            axis_values.setdefault(str(spec.axis), []).append(signal_z[spec.key])
+    axis_loads = {
+        axis: sum(values) / len(values) for axis, values in axis_values.items()
+    }
+    return ModelFeatures(signal_z=signal_z, axis_loads=axis_loads)
+
+
+def _feature_vector(
+    signal_keys: tuple[str, ...], features: ModelFeatures
+) -> tuple[float, ...]:
+    return tuple(features.signal_z.get(key, 0.0) for key in signal_keys)
+
+
+def _distance(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+    return sqrt(sum((a - b) ** 2 for a, b in zip(left, right, strict=True)))
+
+
+def _distance_scores(distances: dict[str, float]) -> dict[str, float]:
+    weights = {
+        profile: exp(-distance / 10.0) for profile, distance in distances.items()
+    }
+    total = sum(weights.values()) or 1.0
+    return {profile: weight / total for profile, weight in weights.items()}
 
 
 def monitoring_scores(engine: Engine, *, day: int) -> MonitoringScores:
