@@ -308,6 +308,25 @@ def test_forecast_heads_learn_episode_onset_ahead_of_time(tmp_path):
     }
 
 
+def test_rook_sourced_training_matches_the_generator(tmp_path):
+    from dataclasses import replace
+
+    generator = train_attunefm_lite(
+        build_training_config("smoke", output_dir=tmp_path / "gen", epochs=40),
+        wandb_enabled=False,
+    )
+    rook = train_attunefm_lite(
+        replace(
+            build_training_config("smoke", output_dir=tmp_path / "rook", epochs=40),
+            source="rook",
+        ),
+        wandb_enabled=False,
+    )
+    # wearables round-trip through Rook exactly, so the model sees identical training data
+    assert rook.eval_accuracy == generator.eval_accuracy
+    assert rook.forecast_metrics == generator.forecast_metrics
+
+
 def test_train_attunefm_lite_logs_to_wandb_when_enabled(tmp_path, monkeypatch):
     events = []
     tables = []

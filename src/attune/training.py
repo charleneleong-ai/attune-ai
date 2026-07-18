@@ -29,6 +29,7 @@ from attune.concordance_engine.concordance import BASELINE_SPAN
 from attune.concordance_engine.engine import Engine, PACKS
 from attune.concordance_engine.memory import Memory
 from attune.datasets import DATASET_CATALOG, DEMO_DATASET_NAMES, DatasetStub
+from attune.rook import ingest_daily_rook
 from attune.synth import (
     ACTIVE_PERIODS,
     ATTUNEFM_PROFILES,
@@ -45,7 +46,7 @@ CONFIG_DIR = Path("configs")
 CHECKIN_LOG_LIMIT = 512
 EXAMPLE_LOG_LIMIT = 400  # per split; an all-day dataset is thousands of rows
 HEATMAP_ROW_LIMIT = 120  # per split; keeps the rendered PNG a readable height
-MEMORY_CACHE: dict[tuple[str, int, int], Memory] = {}
+MEMORY_CACHE: dict[tuple[str, int, int, str], Memory] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +80,9 @@ class TrainingConfig:
         7,
         30,
     )  # days ahead for episode-onset forecasting
+    source: str = (
+        "generator"  # "generator" | "rook" — objective channel via the Rook interface
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +205,7 @@ def _load_training_config_file(name: str) -> TrainingConfig:
         forecast_horizons=_tuple_ints(
             raw.get("forecast_horizons", (7, 30)), field="forecast_horizons"
         ),
+        source=str(raw.get("source", "generator")),
     )
 
 
@@ -283,10 +288,15 @@ def _profile_variant(profile: PatientProfile, seed_offset: int) -> PatientProfil
 def patient_memory(config: TrainingConfig, variant: PatientProfile) -> Memory:
     # generate() is a pure function of (pack, days, profile variant), but four consumers each
     # rebuilt the same timelines — ~69% of the calls were redundant.
-    cached = MEMORY_CACHE.get((config.pack, config.days, variant.seed))
+    key = (config.pack, config.days, variant.seed, config.source)
+    cached = MEMORY_CACHE.get(key)
     if cached is None:
-        cached = generate(PACKS[config.pack], days=config.days, profile=variant)
-        MEMORY_CACHE[(config.pack, config.days, variant.seed)] = cached
+        pack = PACKS[config.pack]
+        cached = generate(pack, days=config.days, profile=variant)
+        if config.source == "rook":
+            # the objective (wearable) channel arrives via the Rook interface, not the generator
+            cached = ingest_daily_rook(cached, pack, config.days)
+        MEMORY_CACHE[key] = cached
     return cached
 
 

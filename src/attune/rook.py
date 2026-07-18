@@ -123,3 +123,24 @@ def signals_from_rook(
         value = section[mapping.field] / mapping.scale
         signals.append(Signal(key, axis_of[key], value, day, source=WEARABLE_MODALITY))
     return signals
+
+
+def ingest_daily_rook(
+    memory: Memory, pack: ConditionPack, days: int, *, user_id: str = "mock-user"
+) -> Memory:
+    """Rebuild the wearable channel by round-tripping every day through Rook payloads.
+
+    Subjective (check-in) signals pass through untouched; the wearable signals are re-derived from
+    Rook documents — exactly what a live Rook webhook would deliver. In the mock the payloads are
+    generated from `memory`, so the result matches the source: the training data is identical
+    whether wearables come from the generator or from Rook, which is what makes the swap safe.
+    """
+    wearable = set(ROOK_MAPPING)
+    rebuilt = Memory(
+        [signal for signal in memory.signals if signal.key not in wearable]
+    )
+    for day in range(days):
+        documents = to_rook_day(memory, day, user_id=user_id)
+        for signal in signals_from_rook(documents, pack, day):
+            rebuilt.add(signal)
+    return rebuilt

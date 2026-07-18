@@ -1,6 +1,7 @@
 from attune.concordance_engine.engine import PACKS
 from attune.rook import (
     ROOK_MAPPING,
+    ingest_daily_rook,
     signals_from_rook,
     to_rook_day,
     wearable_signal_keys,
@@ -8,6 +9,10 @@ from attune.rook import (
 from attune.synth import generate
 
 PACK = PACKS["attunefm"]
+
+
+def _snapshot(memory):
+    return sorted((s.key, s.day, s.source, round(s.value, 4)) for s in memory.signals)
 
 
 def test_rook_mapping_covers_exactly_the_wearable_signals():
@@ -51,3 +56,11 @@ def test_rook_roundtrip_preserves_wearable_signal_values():
         signal.source == "wearable"
         for signal in signals_from_rook(documents, PACK, day=40)
     )
+
+
+def test_ingest_daily_rook_reproduces_the_source_memory():
+    # sourcing the wearable channel through Rook must yield the same data as the generator,
+    # so the mock->live swap can't change what the model trains or serves on
+    memory = generate(PACK, days=90, profile="veteran")
+    rebuilt = ingest_daily_rook(memory, PACK, days=90)
+    assert _snapshot(rebuilt) == _snapshot(memory)
