@@ -12,10 +12,11 @@ webhook and nothing downstream changes.
 High fidelity: each payload carries Terra's real structure — the webhook envelope (`type` / `user`
 / `data`), a model object with `metadata`, the daily `summary` scalar AND the intraday `*_samples`
 array Terra exposes for that signal (`heart_rate_data.detailed.hr_samples`, `oxygen_data.
-saturation_samples`, `glucose_data.blood_glucose_samples`, ...). The model reads the daily summary,
-so the mock replicates the day's value across the sample timestamps rather than inventing intraday
-variation we don't have; real per-sample physiology arrives with a live Terra feed. Field names and
-paths follow Terra's data-model version; pin them against the API reference when wiring the webhook.
+saturation_samples`, `glucose_data.blood_glucose_samples`, ...). When the source has real intraday
+readings (the generator's `intraday` mode), they ride in the sample array and `signals_from_terra`
+recovers them, so intraday features are derivable from Terra alone; otherwise the daily value is
+replicated across the timestamps. Field names and paths follow Terra's data-model version; pin them
+against the API reference when wiring the webhook.
 """
 
 from __future__ import annotations
@@ -115,12 +116,12 @@ def _get_path(obj: dict, path: tuple[str, ...]) -> object | None:
     return obj
 
 
-def _samples(value: float, day: int, sample_key: str) -> list[dict]:
+def _sample_array(values: tuple[float, ...], day: int, sample_key: str) -> list[dict]:
     base = BASE_DATETIME + timedelta(days=day)
-    step = timedelta(hours=24 / SAMPLES_PER_DAY)
+    step = timedelta(hours=24 / len(values))
     return [
         {"timestamp": _iso(base + step * i), sample_key: value}
-        for i in range(SAMPLES_PER_DAY)
+        for i, value in enumerate(values)
     ]
 
 
@@ -165,21 +166,27 @@ def to_terra_day(
     memory: Memory, day: int, *, user_id: str = "mock-user"
 ) -> dict[str, dict]:
     """One Terra webhook payload per data type for the given day, keyed by `type`."""
-    day_values = {signal.key: signal.value for signal in memory.window(day, 1)}
+    day_signals = {signal.key: signal for signal in memory.window(day, 1)}
     payloads: dict[str, dict] = {}
     for key, mapping in TERRA_MAPPING.items():
-        if key not in day_values:
+        signal = day_signals.get(key)
+        if signal is None:
             continue
         model = _model(
             payloads.setdefault(
                 mapping.data_type, _payload(mapping.data_type, day, user_id)
             )
         )
-        value = round(day_values[key] * mapping.scale, 4)
+        value = round(signal.value * mapping.scale, 4)
         _set_path(model, mapping.summary_path, value)
         if mapping.sample_path:
+            # carry the real intraday readings when present, else the daily value replicated
+            raw = signal.samples or (value,) * SAMPLES_PER_DAY
+            samples = tuple(round(reading * mapping.scale, 4) for reading in raw)
             _set_path(
-                model, mapping.sample_path, _samples(value, day, mapping.sample_key)
+                model,
+                mapping.sample_path,
+                _sample_array(samples, day, mapping.sample_key),
             )
     return payloads
 
@@ -194,12 +201,24 @@ def signals_from_terra(
         payload = payloads.get(mapping.data_type)
         if payload is None:
             continue
-        value = _get_path(_model(payload), mapping.summary_path)
+        model = _model(payload)
+        value = _get_path(model, mapping.summary_path)
         if value is None:
             continue
+        raw = _get_path(model, mapping.sample_path) if mapping.sample_path else None
+        samples = (
+            tuple(point[mapping.sample_key] / mapping.scale for point in raw)
+            if raw
+            else ()
+        )
         signals.append(
             Signal(
-                key, axis_of[key], value / mapping.scale, day, source=WEARABLE_MODALITY
+                key,
+                axis_of[key],
+                value / mapping.scale,
+                day,
+                source=WEARABLE_MODALITY,
+                samples=samples,
             )
         )
     return signals

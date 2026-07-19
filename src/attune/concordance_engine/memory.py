@@ -11,6 +11,7 @@ class Signal:
     day: int  # day index in the patient's timeline
     source: str = "self_report"  # audio | vision | wearable | text | self_report
     note: str = ""
+    samples: tuple[float, ...] = ()  # optional intraday readings behind the daily value
 
 
 @dataclass
