@@ -12,6 +12,7 @@ dependencies = [
     "pillow>=12.3.0",
     "pyyaml>=6.0.3",
     "torch>=2.13.0",
+    "fastapi",
 ]
 
 [project.optional-dependencies]
@@ -37,3 +38,8 @@ packages = ["src/attune"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+]

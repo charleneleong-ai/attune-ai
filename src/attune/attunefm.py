@@ -1,14 +1,77 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import exp, sqrt
+from math import exp, fsum, sqrt
 
-from attune.concordance_engine.concordance import baseline_history, robust_z
+from statistics import fmean
+
+from attune.concordance_engine.concordance import (
+    BASELINE_SPAN,
+    baseline_history,
+    robust_z,
+)
 from attune.concordance_engine.engine import Engine
 from attune.concordance_engine.memory import Memory
 from attune.datasets import DatasetStub, datasets_for_modality
 from attune.packs.base import ConditionPack
 from attune.packs.axes import Axis
+
+FEATURE_WINDOW = 30  # default trailing days summarised per signal
+CHECKPOINT_SCHEMA = "attunefm-lite-linear-v1"  # written by training, checked by serving
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointModel:
+    """The served-model surface of a checkpoint: exactly the fields training writes and serving
+    reads to run inference. Metadata (metrics, artifacts, day_types, full config) rides alongside
+    in the checkpoint JSON but is not part of this contract — it defines the train/serve seam in
+    one place so neither side hard-codes the other's JSON keys."""
+
+    pack: str
+    feature_window: int
+    labels: tuple[str, ...]
+    feature_mean: tuple[float, ...]
+    feature_scale: tuple[float, ...]
+    weights: list[list[float]]
+    bias: list[float]
+    forecast_weights: list[list[float]]
+    forecast_bias: list[float]
+    forecast_horizons: tuple[int, ...]
+
+    def to_dict(self) -> dict:
+        return {
+            "schema": CHECKPOINT_SCHEMA,
+            "pack": self.pack,
+            "feature_window": self.feature_window,
+            "labels": list(self.labels),
+            "feature_mean": list(self.feature_mean),
+            "feature_scale": list(self.feature_scale),
+            "weights": self.weights,
+            "bias": self.bias,
+            "forecast_weights": self.forecast_weights,
+            "forecast_bias": self.forecast_bias,
+            "forecast_horizons": list(self.forecast_horizons),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CheckpointModel:
+        schema = data.get("schema")
+        if schema != CHECKPOINT_SCHEMA:
+            raise ValueError(
+                f"unsupported checkpoint schema {schema!r}; expected {CHECKPOINT_SCHEMA!r}"
+            )
+        return cls(
+            pack=data["pack"],
+            feature_window=int(data["feature_window"]),
+            labels=tuple(data["labels"]),
+            feature_mean=tuple(data["feature_mean"]),
+            feature_scale=tuple(data["feature_scale"]),
+            weights=data["weights"],
+            bias=data["bias"],
+            forecast_weights=data["forecast_weights"],
+            forecast_bias=data["forecast_bias"],
+            forecast_horizons=tuple(data["forecast_horizons"]),
+        )
 
 
 SOURCE_MODALITIES = {
@@ -160,6 +223,101 @@ def _feature_vector(
     signal_keys: tuple[str, ...], features: ModelFeatures
 ) -> tuple[float, ...]:
     return tuple(features.signal_z.get(key, 0.0) for key in signal_keys)
+
+
+def window_feature_keys(pack: ConditionPack) -> tuple[str, ...]:
+    """Column names for the trained head's feature vector, in vector order."""
+    keys = tuple(spec.key for spec in pack.signals)
+    return (
+        *keys,  # |robust z| against the personal baseline
+        *(f"value_{key}" for key in keys),  # latest raw value
+        *(f"mean_{key}" for key in keys),  # trailing-window mean
+        *(f"std_{key}" for key in keys),  # trailing-window volatility
+    )
+
+
+def series_by_day(
+    memory: Memory, signal_keys: tuple[str, ...], days: int
+) -> dict[str, list[float]]:
+    """Dense per-signal day arrays — one pass, so per-day lookups stop rescanning the memory."""
+    values = {key: [0.0] * days for key in signal_keys}
+    for signal in memory.signals:
+        if signal.key in values and 0 <= signal.day < days:
+            values[signal.key][signal.day] = signal.value
+    return values
+
+
+def population_stdev(values: list[float], mean: float) -> float:
+    # statistics.pstdev works in exact Fraction arithmetic and costs ~11x this at our call volume.
+    if len(values) < 2:
+        return 0.0
+    return sqrt(fsum((value - mean) ** 2 for value in values) / len(values))
+
+
+def window_features(
+    values: dict[str, list[float]],
+    signal_keys: tuple[str, ...],
+    *,
+    day: int,
+    window: int = FEATURE_WINDOW,
+) -> tuple[float, ...]:
+    """The trained head's features for one day.
+
+    A patient's baseline offset is stable but noisy day to day, so summarising a trailing window
+    cuts that noise ~sqrt(window) — which is what makes a profile identifiable on a quiet day and
+    not just during a flare.
+    """
+    z_scores, latest, means, deviations = [], [], [], []
+    for key in signal_keys:
+        series = values[key]
+        current = series[day]
+        history = series[max(0, day - BASELINE_SPAN) : day]
+        trailing = series[max(0, day - window) : day + 1]
+        mean = fmean(trailing)
+        z_scores.append(abs(robust_z(current, history)))
+        latest.append(current)
+        means.append(mean)
+        deviations.append(population_stdev(trailing, mean))
+    return (*z_scores, *latest, *means, *deviations)
+
+
+# --- torch-free linear-head inference, shared by training (metrics) and serving ---
+
+
+def standardize(
+    values: tuple[float, ...], means: tuple[float, ...], scales: tuple[float, ...]
+) -> tuple[float, ...]:
+    return tuple(
+        (value - mean) / scale
+        for value, mean, scale in zip(values, means, scales, strict=True)
+    )
+
+
+def logits(
+    features: tuple[float, ...], weights: list[list[float]], bias: list[float]
+) -> tuple[float, ...]:
+    return tuple(
+        sum(weight * value for weight, value in zip(row, features, strict=True))
+        + bias[i]
+        for i, row in enumerate(weights)
+    )
+
+
+def softmax(values: tuple[float, ...]) -> tuple[float, ...]:
+    shifted = tuple(value - max(values) for value in values)
+    exps = tuple(exp(value) for value in shifted)
+    total = sum(exps) or 1.0
+    return tuple(value / total for value in exps)
+
+
+def predict_proba(
+    features: tuple[float, ...], weights: list[list[float]], bias: list[float]
+) -> tuple[float, ...]:
+    return softmax(logits(features, weights, bias))
+
+
+def sigmoid(value: float) -> float:
+    return 1.0 / (1.0 + exp(-value))
 
 
 def _distance(left: tuple[float, ...], right: tuple[float, ...]) -> float:

@@ -252,9 +252,71 @@ ATTUNEFM_PROFILES: dict[str, PatientProfile] = {
 }
 
 
+EPISODE_LENGTH_RANGE = (3, 10)
+MIN_EPISODE_GAP = 21
+MULTI_EPISODE_DAYS = 150  # below this a timeline keeps the single demo flare
+PERIOD_SHOULDER = 7  # days either side of an episode counted as pre_flare / recovery
+
+# The day-type taxonomy belongs with the flare geometry that defines it, not with any one
+# consumer. "Active" days are exactly the days inside an episode.
+ACTIVE_PERIODS = frozenset({"flare_onset", "flare_peak", "flare_late", "flare"})
+PERIOD_NAMES = (*sorted(ACTIVE_PERIODS), "pre_flare", "recovery", "baseline")
+
+
+def episode_onset_within(
+    day: int, windows: tuple[FlareWindow, ...], horizons: tuple[int, ...]
+) -> tuple[int, ...]:
+    """1 per horizon: an episode onset falls within that many days after `day` (forecast target)."""
+    onsets = [window.onset for window in windows]
+    return tuple(
+        int(any(day < onset <= day + horizon for onset in onsets))
+        for horizon in horizons
+    )
+
+
+def day_period(day: int, windows: tuple[FlareWindow, ...]) -> str:
+    """Label a day against every planted episode, not just the last one."""
+    for window in windows:
+        if day == window.onset:
+            return "flare_onset"
+        if day == window.midpoint:
+            return "flare_peak"
+        if day == window.end - 1:
+            return "flare_late"
+        if window.onset <= day < window.end:
+            return "flare"
+    for window in windows:
+        if window.end <= day < window.end + PERIOD_SHOULDER:
+            return "recovery"
+        if window.onset - PERIOD_SHOULDER <= day < window.onset:
+            return "pre_flare"
+    return "baseline"
+
+
 def flare_window(days: int) -> FlareWindow:
-    # A short flare near "today" so reflect() catches it live.
+    # The episode nearest "today" — what reflect()/the demo catches live.
     return FlareWindow(days - 12, 5)
+
+
+def flare_windows(days: int, *, seed: int = 0) -> tuple[FlareWindow, ...]:
+    """Relapsing-remitting episodes across a long timeline, ending at the demo flare.
+
+    A chronic condition flares repeatedly, so a year holds several episodes at patient-specific
+    times. One episode per year gives a forecaster a single positive event per patient — not
+    enough to learn from. Short (demo/smoke) timelines keep the single planted flare unchanged.
+    """
+    final = flare_window(days)
+    if days < MULTI_EPISODE_DAYS:
+        return (final,)
+
+    rng = random.Random(seed + 7919)
+    windows: list[FlareWindow] = []
+    onset = MIN_EPISODE_GAP + rng.randint(0, 30)
+    while onset + EPISODE_LENGTH_RANGE[1] < final.onset - MIN_EPISODE_GAP:
+        length = rng.randint(*EPISODE_LENGTH_RANGE)
+        windows.append(FlareWindow(onset, length))
+        onset += length + rng.randint(MIN_EPISODE_GAP, 80)
+    return (*windows, final)
 
 
 def sample(spec: SignalSpec, day: int, rng: random.Random) -> float:
@@ -281,14 +343,17 @@ def generate(
     patient = _resolve_profile(profile)
     seed = patient.seed if patient else seed
     rng = random.Random(seed)
-    window = flare_window(days)
+    windows = flare_windows(days, seed=seed)
+    flare_days = {
+        day for window in windows for day in range(window.onset, min(window.end, days))
+    }
     mem = Memory()
     for spec in pack.signals:
         for day in range(days):
             value = sample(spec, day, rng)
             if patient:
                 value += patient.offsets.get(spec.key, 0.0)
-            if window.onset <= day < window.end:
+            if day in flare_days:
                 flare = spec.flare
                 if patient:
                     multiplier = patient.flare_multipliers.get(spec.key)

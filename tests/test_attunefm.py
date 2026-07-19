@@ -1,5 +1,9 @@
+import pytest
+
 from attune.attunefm import (
+    CHECKPOINT_SCHEMA,
     AttuneFMLiteModel,
+    CheckpointModel,
     dataset_grounding,
     featurize_memory,
     monitoring_answer,
@@ -169,3 +173,32 @@ def test_metabolic_pcos_monitoring_answer_recommends_metabolic_followup():
 
     assert "meal, sleep, and glucose pattern" in answer.recommendation
     assert "diet response" in answer.recommendation
+
+
+class TestCheckpointModel:
+    """The train/serve seam: to_dict/from_dict must round-trip and reject foreign schemas."""
+
+    model = CheckpointModel(
+        pack="attunefm",
+        feature_window=30,
+        labels=("veteran", "metabolic_pcos"),
+        feature_mean=(0.0, 1.0),
+        feature_scale=(1.0, 2.0),
+        weights=[[0.1, 0.2], [0.3, 0.4]],
+        bias=[0.0, 0.5],
+        forecast_weights=[[0.6, 0.7]],
+        forecast_bias=[0.1],
+        forecast_horizons=(7, 30),
+    )
+
+    def test_round_trips_through_dict(self):
+        assert CheckpointModel.from_dict(self.model.to_dict()) == self.model
+
+    def test_to_dict_tags_schema(self):
+        assert self.model.to_dict()["schema"] == CHECKPOINT_SCHEMA
+
+    @pytest.mark.parametrize("schema", ["attunefm-lite-linear-v0", "other", None])
+    def test_from_dict_rejects_foreign_schema(self, schema):
+        payload = {**self.model.to_dict(), "schema": schema}
+        with pytest.raises(ValueError, match="unsupported checkpoint schema"):
+            CheckpointModel.from_dict(payload)

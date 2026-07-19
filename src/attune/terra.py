@@ -1,0 +1,226 @@
+"""Terra data-aggregator interface — mock now, live API later.
+
+Terra (https://docs.tryterra.co) normalises wearable data (Garmin / Fitbit / Apple / Oura / ...)
+into typed payloads (Daily, Sleep, Body, Activity, ...). Our `wearable`-modality signals are that
+objective channel — the subjective voice/vision/self-report signals come from the check-in layer,
+not a wearable, so they are deliberately not Terra.
+
+This module emits a patient day as Terra-shaped webhook payloads and ingests them back into
+`Signal`s. The point is the interface: swap `to_terra_day` (the mock source) for Terra's live
+webhook and nothing downstream changes.
+
+High fidelity: each payload carries Terra's real structure — the webhook envelope (`type` / `user`
+/ `data`), a model object with `metadata`, the daily `summary` scalar AND the intraday `*_samples`
+array Terra exposes for that signal (`heart_rate_data.detailed.hr_samples`, `oxygen_data.
+saturation_samples`, `glucose_data.blood_glucose_samples`, ...). The model reads the daily summary,
+so the mock replicates the day's value across the sample timestamps rather than inventing intraday
+variation we don't have; real per-sample physiology arrives with a live Terra feed. Field names and
+paths follow Terra's data-model version; pin them against the API reference when wiring the webhook.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+
+from attune.concordance_engine.memory import Memory, Signal
+from attune.packs.base import ConditionPack
+
+TERRA_VERSION = "2022_03_16"  # Terra data-model version tag carried on every payload
+BASE_DATETIME = datetime(
+    2026, 1, 1, tzinfo=UTC
+)  # day index 0; keeps mock datetimes deterministic
+WEARABLE_MODALITY = "wearable"
+SAMPLES_PER_DAY = (
+    6  # intraday points emitted per signal — enough to be a faithful *_samples array
+)
+
+
+@dataclass(frozen=True, slots=True)
+class TerraField:
+    data_type: str  # Terra payload type: daily | sleep | body
+    summary_path: tuple[
+        str, ...
+    ]  # nested keys to the daily scalar within the model object
+    sample_path: tuple[
+        str, ...
+    ]  # nested keys to the intraday sample array ("" -> no samples)
+    sample_key: str  # value field inside each sample object (Terra's per-sample naming)
+    scale: float = 1.0  # signal value * scale = Terra value (e.g. hours -> seconds)
+
+
+# Maps each objective signal onto its Terra home. Keys must stay in lockstep with the pack's
+# `wearable` signals — `test_terra_mapping_covers_exactly_the_wearable_signals` enforces that.
+TERRA_MAPPING: dict[str, TerraField] = {
+    "hrv": TerraField(
+        "daily",
+        ("heart_rate_data", "summary", "avg_hrv_rmssd"),
+        ("heart_rate_data", "detailed", "hrv_samples_rmssd"),
+        "hrv_rmssd",
+    ),
+    "resting_hr": TerraField(
+        "daily",
+        ("heart_rate_data", "summary", "resting_hr_bpm"),
+        ("heart_rate_data", "detailed", "hr_samples"),
+        "bpm",
+    ),
+    "spo2": TerraField(
+        "daily",
+        ("oxygen_data", "avg_saturation_percentage"),
+        ("oxygen_data", "saturation_samples"),
+        "percentage",
+    ),
+    "sleep_hours": TerraField(
+        "sleep",
+        ("sleep_durations_data", "asleep", "duration_asleep_state_seconds"),
+        (),
+        "",
+        scale=3600.0,
+    ),
+    "glucose_variability": TerraField(
+        "body",
+        ("glucose_data", "day_avg_blood_glucose_mg_per_dL"),
+        ("glucose_data", "blood_glucose_samples"),
+        "blood_glucose_mg_per_dL",
+    ),
+}
+
+
+def wearable_signal_keys(pack: ConditionPack) -> tuple[str, ...]:
+    return tuple(
+        spec.key for spec in pack.signals if spec.modality == WEARABLE_MODALITY
+    )
+
+
+def terra_datetime(day: int) -> str:
+    return _iso(BASE_DATETIME + timedelta(days=day))
+
+
+def _iso(when: datetime) -> str:
+    # Terra ISO-8601: full timestamp with microseconds + timezone, e.g. ...T00:00:00.000000Z.
+    return when.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def _set_path(obj: dict, path: tuple[str, ...], value: object) -> None:
+    for key in path[:-1]:
+        obj = obj.setdefault(key, {})
+    obj[path[-1]] = value
+
+
+def _get_path(obj: dict, path: tuple[str, ...]) -> object | None:
+    for key in path:
+        if not isinstance(obj, dict) or key not in obj:
+            return None
+        obj = obj[key]
+    return obj
+
+
+def _samples(value: float, day: int, sample_key: str) -> list[dict]:
+    base = BASE_DATETIME + timedelta(days=day)
+    step = timedelta(hours=24 / SAMPLES_PER_DAY)
+    return [
+        {"timestamp": _iso(base + step * i), sample_key: value}
+        for i in range(SAMPLES_PER_DAY)
+    ]
+
+
+def terra_envelope(
+    data_type: str, *, user_id: str, provider: str, data: list[dict]
+) -> dict:
+    """The Terra webhook envelope every payload shares: type + version + user + data array.
+
+    One home for the envelope shape and the version tag, so ingest payloads and the serving
+    prediction speak the exact same wrapper.
+    """
+    return {
+        "type": data_type,
+        "version": TERRA_VERSION,
+        "user": {"user_id": user_id, "provider": provider, "reference_id": None},
+        "data": data,
+    }
+
+
+def _payload(data_type: str, day: int, user_id: str) -> dict:
+    return terra_envelope(
+        data_type,
+        user_id=user_id,
+        provider="mock",
+        data=[
+            {
+                "metadata": {
+                    "start_time": terra_datetime(day),
+                    "end_time": terra_datetime(day + 1),
+                    "upload_type": 0,
+                }
+            }
+        ],
+    )
+
+
+def _model(payload: dict) -> dict:
+    return payload["data"][0]
+
+
+def to_terra_day(
+    memory: Memory, day: int, *, user_id: str = "mock-user"
+) -> dict[str, dict]:
+    """One Terra webhook payload per data type for the given day, keyed by `type`."""
+    day_values = {signal.key: signal.value for signal in memory.window(day, 1)}
+    payloads: dict[str, dict] = {}
+    for key, mapping in TERRA_MAPPING.items():
+        if key not in day_values:
+            continue
+        model = _model(
+            payloads.setdefault(
+                mapping.data_type, _payload(mapping.data_type, day, user_id)
+            )
+        )
+        value = round(day_values[key] * mapping.scale, 4)
+        _set_path(model, mapping.summary_path, value)
+        if mapping.sample_path:
+            _set_path(
+                model, mapping.sample_path, _samples(value, day, mapping.sample_key)
+            )
+    return payloads
+
+
+def signals_from_terra(
+    payloads: dict[str, dict], pack: ConditionPack, day: int
+) -> list[Signal]:
+    """Inverse of `to_terra_day`: recover typed Signals from the daily summary of each payload."""
+    axis_of = pack.axis_of
+    signals = []
+    for key, mapping in TERRA_MAPPING.items():
+        payload = payloads.get(mapping.data_type)
+        if payload is None:
+            continue
+        value = _get_path(_model(payload), mapping.summary_path)
+        if value is None:
+            continue
+        signals.append(
+            Signal(
+                key, axis_of[key], value / mapping.scale, day, source=WEARABLE_MODALITY
+            )
+        )
+    return signals
+
+
+def ingest_daily_terra(
+    memory: Memory, pack: ConditionPack, days: int, *, user_id: str = "mock-user"
+) -> Memory:
+    """Rebuild the wearable channel by round-tripping every day through Terra payloads.
+
+    Subjective (check-in) signals pass through untouched; the wearable signals are re-derived from
+    Terra payloads — exactly what a live Terra webhook would deliver. In the mock the payloads are
+    generated from `memory`, so the result matches the source: the training data is identical
+    whether wearables come from the generator or from Terra, which is what makes the swap safe.
+    """
+    wearable = set(TERRA_MAPPING)
+    rebuilt = Memory(
+        [signal for signal in memory.signals if signal.key not in wearable]
+    )
+    for day in range(days):
+        payloads = to_terra_day(memory, day, user_id=user_id)
+        for signal in signals_from_terra(payloads, pack, day):
+            rebuilt.add(signal)
+    return rebuilt

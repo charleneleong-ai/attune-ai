@@ -7,7 +7,6 @@ import zlib
 from binascii import crc32
 from dataclasses import asdict, dataclass, replace
 from importlib import import_module
-from math import exp
 from pathlib import Path
 from shutil import which
 
@@ -17,15 +16,39 @@ import yaml
 from rich.console import Console
 from rich.table import Table
 
-from attune.attunefm import ModelFeatures, featurize_memory, monitoring_scores
+from attune.attunefm import (
+    FEATURE_WINDOW,
+    CheckpointModel,
+    featurize_memory,
+    monitoring_scores,
+    predict_proba,
+    series_by_day,
+    standardize,
+    window_feature_keys,
+    window_features,
+)
+from attune.concordance_engine.concordance import BASELINE_SPAN
 from attune.concordance_engine.engine import Engine, PACKS
 from attune.concordance_engine.memory import Memory
 from attune.datasets import DATASET_CATALOG, DEMO_DATASET_NAMES, DatasetStub
-from attune.synth import ATTUNEFM_PROFILES, PatientProfile, flare_window, generate
+from attune.terra import ingest_daily_terra
+from attune.synth import (
+    ACTIVE_PERIODS,
+    ATTUNEFM_PROFILES,
+    PatientProfile,
+    day_period,
+    episode_onset_within,
+    flare_window,
+    flare_windows,
+    generate,
+)
 
 console = Console()
 CONFIG_DIR = Path("configs")
 CHECKIN_LOG_LIMIT = 512
+EXAMPLE_LOG_LIMIT = 400  # per split; an all-day dataset is thousands of rows
+HEATMAP_ROW_LIMIT = 120  # per split; keeps the rendered PNG a readable height
+MEMORY_CACHE: dict[tuple[str, int, int, str], Memory] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +77,14 @@ class TrainingConfig:
     weight_decay: float = (
         0.0  # L2 penalty; the linear head overfits 120 examples without it
     )
+    feature_window: int = FEATURE_WINDOW  # trailing days summarised per signal
+    forecast_horizons: tuple[int, ...] = (
+        7,
+        30,
+    )  # days ahead for episode-onset forecasting
+    source: str = (
+        "generator"  # "generator" | "terra" — objective channel via the Terra interface
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +94,9 @@ class TrainingExample:
     day: int
     period: str
     features: tuple[float, ...]
+    forecast: tuple[
+        int, ...
+    ] = ()  # 1 per horizon: an episode onsets within that many days
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +136,7 @@ class TrainingRun:
     train_active_accuracy: float
     eval_active_accuracy: float
     eval_accuracy_by_period: dict[str, float]
+    forecast_metrics: dict[int, dict[str, float]]
     final_loss: float
     checkpoint_path: Path
     source_signal_path: Path
@@ -151,6 +186,11 @@ def _load_training_config_file(name: str) -> TrainingConfig:
     dataset_names = _tuple_strings(
         raw.get("dataset_names", _default_datasets()), field="dataset_names"
     )
+    source = str(raw.get("source", "generator"))
+    if source not in {"generator", "terra"}:
+        raise ValueError(
+            f"training config 'source' must be 'generator' or 'terra', got {source!r}"
+        )
     return TrainingConfig(
         name=config_name,
         pack=str(raw.get("pack", "attunefm")),
@@ -168,6 +208,11 @@ def _load_training_config_file(name: str) -> TrainingConfig:
         ),
         output_dir=Path(raw.get("output_dir", f"runs/attunefm-{config_name}")),
         weight_decay=float(raw.get("weight_decay", 0.0)),
+        feature_window=int(raw.get("feature_window", FEATURE_WINDOW)),
+        forecast_horizons=_tuple_ints(
+            raw.get("forecast_horizons", (7, 30)), field="forecast_horizons"
+        ),
+        source=source,
     )
 
 
@@ -247,51 +292,23 @@ def _profile_variant(profile: PatientProfile, seed_offset: int) -> PatientProfil
     return replace(profile, seed=profile.seed + seed_offset)
 
 
-def _features(pack_name: str, memory: Memory, *, day: int) -> ModelFeatures:
-    return featurize_memory(PACKS[pack_name], memory, day=day)
+def patient_memory(config: TrainingConfig, variant: PatientProfile) -> Memory:
+    # generate() is a pure function of (pack, days, profile variant), but four consumers each
+    # rebuilt the same timelines — ~69% of the calls were redundant.
+    key = (config.pack, config.days, variant.seed, config.source)
+    cached = MEMORY_CACHE.get(key)
+    if cached is None:
+        pack = PACKS[config.pack]
+        cached = generate(pack, days=config.days, profile=variant)
+        if config.source == "terra":
+            # the objective (wearable) channel arrives via the Terra interface, not the generator
+            cached = ingest_daily_terra(cached, pack, config.days)
+        MEMORY_CACHE[key] = cached
+    return cached
 
 
 def _signal_keys(pack_name: str) -> tuple[str, ...]:
     return tuple(spec.key for spec in PACKS[pack_name].signals)
-
-
-def _feature_keys(pack_name: str) -> tuple[str, ...]:
-    signal_keys = _signal_keys(pack_name)
-    return (*signal_keys, *(f"value_{key}" for key in signal_keys))
-
-
-def _latest_value(memory: Memory, key: str, day: int) -> float:
-    series = [signal for signal in memory.series(key) if signal.day <= day]
-    return series[-1].value if series else 0.0
-
-
-def _vector(
-    feature_keys: tuple[str, ...], features: ModelFeatures, memory: Memory, *, day: int
-) -> tuple[float, ...]:
-    return tuple(
-        _latest_value(memory, key.removeprefix("value_"), day)
-        if key.startswith("value_")
-        else features.signal_z.get(key, 0.0)
-        for key in feature_keys
-    )
-
-
-def _temporal_periods(days: int) -> tuple[tuple[str, int], ...]:
-    window = flare_window(days)
-    candidates = (
-        ("pre_flare", max(30, window.onset - 2)),
-        ("flare_onset", window.onset),
-        ("flare_peak", window.midpoint),
-        ("flare_late", window.end - 1),
-        ("recovery", min(days - 1, window.end + 3)),
-    )
-    seen: set[int] = set()
-    periods = []
-    for period, day in candidates:
-        if day not in seen:
-            seen.add(day)
-            periods.append((period, day))
-    return tuple(periods)
 
 
 def _source_signal_records(config: TrainingConfig) -> int:
@@ -360,13 +377,13 @@ def _checkin_records(config: TrainingConfig) -> tuple[CheckinRecord, ...]:
     records = []
     seed_offsets = (*config.train_seed_offsets, *config.eval_seed_offsets)
     pack = PACKS[config.pack]
+    checkin_keys = tuple(item.signal_key for item in pack.checkin)
     for profile_name, profile in ATTUNEFM_PROFILES.items():
         for seed_offset in seed_offsets:
-            memory = generate(
-                pack,
-                days=config.days,
-                profile=_profile_variant(profile, seed_offset),
-            )
+            memory = patient_memory(config, _profile_variant(profile, seed_offset))
+            # One dense pass instead of re-scanning the memory for every (day, prompt) — this
+            # loop was the single biggest cost in a run.
+            values = series_by_day(memory, checkin_keys, config.days)
             for day in range(config.days):
                 for item in pack.checkin:
                     missing_reason = _missing_reason(
@@ -377,11 +394,7 @@ def _checkin_records(config: TrainingConfig) -> tuple[CheckinRecord, ...]:
                         optional=item.optional,
                     )
                     answered = missing_reason == ""
-                    value = (
-                        _latest_value(memory, item.signal_key, day)
-                        if answered
-                        else None
-                    )
+                    value = values[item.signal_key][day] if answered else None
                     capture_modality = _capture_modality(item.source)
                     records.append(
                         CheckinRecord(
@@ -414,15 +427,10 @@ def _checkin_records(config: TrainingConfig) -> tuple[CheckinRecord, ...]:
 def _write_source_signal_records(config: TrainingConfig, path: Path) -> int:
     count = 0
     seed_offsets = (*config.train_seed_offsets, *config.eval_seed_offsets)
-    pack = PACKS[config.pack]
     with path.open("w") as file:
         for profile_name, profile in ATTUNEFM_PROFILES.items():
             for seed_offset in seed_offsets:
-                memory = generate(
-                    pack,
-                    days=config.days,
-                    profile=_profile_variant(profile, seed_offset),
-                )
+                memory = patient_memory(config, _profile_variant(profile, seed_offset))
                 for signal in sorted(
                     memory.signals, key=lambda item: (item.day, item.key, item.source)
                 ):
@@ -454,28 +462,31 @@ def _write_checkin_records(path: Path, records: tuple[CheckinRecord, ...]) -> No
 def _examples(
     config: TrainingConfig, seed_offsets: tuple[int, ...]
 ) -> tuple[TrainingExample, ...]:
-    feature_keys = _feature_keys(config.pack)
-    temporal_periods = _temporal_periods(config.days)
+    # Every day of the timeline, not a handful of landmark days: the generator produces a full
+    # year per patient and sampling 5 days threw away ~99% of it.
+    signal_keys = _signal_keys(config.pack)
+    first_day = max(BASELINE_SPAN, config.feature_window)
     examples = []
     for profile_name, profile in ATTUNEFM_PROFILES.items():
         for seed_offset in seed_offsets:
-            memory = generate(
-                PACKS[config.pack],
-                days=config.days,
-                profile=_profile_variant(profile, seed_offset),
-            )
-            for period, day in temporal_periods:
+            variant = _profile_variant(profile, seed_offset)
+            memory = patient_memory(config, variant)
+            # Episode timing is patient-specific, so day labels come from this patient's own
+            # episodes rather than one shared window.
+            windows = flare_windows(config.days, seed=variant.seed)
+            values = series_by_day(memory, signal_keys, config.days)
+            for day in range(first_day, config.days):
                 examples.append(
                     TrainingExample(
                         profile=profile_name,
                         seed_offset=seed_offset,
                         day=day,
-                        period=period,
-                        features=_vector(
-                            feature_keys,
-                            _features(config.pack, memory, day=day),
-                            memory,
-                            day=day,
+                        period=day_period(day, windows),
+                        features=window_features(
+                            values, signal_keys, day=day, window=config.feature_window
+                        ),
+                        forecast=episode_onset_within(
+                            day, windows, config.forecast_horizons
                         ),
                     )
                 )
@@ -495,37 +506,11 @@ def _mean_scale(
         variance = sum((example.features[i] - mean) ** 2 for example in examples) / len(
             examples
         )
-        scales.append(max(variance**0.5, 1.0))
+        # Guard against divide-by-zero only. Flooring at 1.0 would leave every sub-unit-variance
+        # signal (spo2, valence, breathlessness, voice_fatigue) effectively unstandardized, so the
+        # head learns to ignore them — that alone cost ~half the single-day accuracy.
+        scales.append(max(variance**0.5, 1e-6))
     return means, tuple(scales)
-
-
-def _standardize(
-    values: tuple[float, ...], means: tuple[float, ...], scales: tuple[float, ...]
-) -> tuple[float, ...]:
-    return tuple(
-        (value - mean) / scale
-        for value, mean, scale in zip(values, means, scales, strict=True)
-    )
-
-
-def _softmax(logits: tuple[float, ...]) -> tuple[float, ...]:
-    shifted = tuple(logit - max(logits) for logit in logits)
-    exps = tuple(exp(logit) for logit in shifted)
-    total = sum(exps) or 1.0
-    return tuple(value / total for value in exps)
-
-
-def _predict_proba(
-    features: tuple[float, ...],
-    weights: list[list[float]],
-    bias: list[float],
-) -> tuple[float, ...]:
-    logits = tuple(
-        sum(weight * value for weight, value in zip(row, features, strict=True))
-        + bias[i]
-        for i, row in enumerate(weights)
-    )
-    return _softmax(logits)
 
 
 def _select_device(accelerator: str) -> str:
@@ -549,11 +534,7 @@ def _train_linear_classifier(
     # stays framework-free — the sequence encoder ("AttuneFM proper") swaps in behind this shape.
     means, scales = _mean_scale(examples)
     label_index = {label: i for i, label in enumerate(labels)}
-    features = torch.tensor(
-        [_standardize(example.features, means, scales) for example in examples],
-        dtype=torch.float32,
-        device=device,
-    )
+    features = _feature_matrix(examples, means, scales, device)
     targets = torch.tensor(
         [label_index[example.profile] for example in examples],
         dtype=torch.long,
@@ -588,23 +569,11 @@ def _accuracy(
 ) -> float:
     correct = 0
     for example in examples:
-        x = _standardize(example.features, means, scales)
-        probs = _predict_proba(x, weights, bias)
+        x = standardize(example.features, means, scales)
+        probs = predict_proba(x, weights, bias)
         predicted = labels[max(range(len(labels)), key=probs.__getitem__)]
         correct += predicted == example.profile
     return correct / len(examples)
-
-
-def _active_periods(days: int) -> frozenset[str]:
-    # "active" = temporal periods that fall inside the planted flare window. Baseline days
-    # (pre_flare/recovery) carry no condition signal, so identifying a profile there is
-    # underdetermined — the blended accuracy is dragged down by them, not by the model.
-    window = flare_window(days)
-    return frozenset(
-        period
-        for period, day in _temporal_periods(days)
-        if window.onset <= day < window.end
-    )
 
 
 def _accuracy_by_period(
@@ -617,8 +586,8 @@ def _accuracy_by_period(
 ) -> dict[str, float]:
     tally: dict[str, list[int]] = {}
     for example in examples:
-        x = _standardize(example.features, means, scales)
-        probs = _predict_proba(x, weights, bias)
+        x = standardize(example.features, means, scales)
+        probs = predict_proba(x, weights, bias)
         predicted = labels[max(range(len(labels)), key=probs.__getitem__)]
         bucket = tally.setdefault(example.period, [0, 0])
         bucket[0] += predicted == example.profile
@@ -640,6 +609,92 @@ def _active_accuracy(
     return _accuracy(subset, labels, weights, bias, means, scales) if subset else 0.0
 
 
+def _feature_matrix(
+    examples: tuple[TrainingExample, ...],
+    means: tuple[float, ...],
+    scales: tuple[float, ...],
+    device: str,
+) -> torch.Tensor:
+    return torch.tensor(
+        [standardize(example.features, means, scales) for example in examples],
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def _binary_auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    positives = labels.sum().item()
+    negatives = labels.numel() - positives
+    if positives == 0 or negatives == 0:
+        return 0.5  # undefined without both classes; report chance
+    order = torch.argsort(scores)
+    ranked = labels[order]
+    ranks = torch.arange(1, labels.numel() + 1, dtype=torch.float32)
+    rank_sum = ranks[ranked == 1].sum().item()
+    return (rank_sum - positives * (positives + 1) / 2) / (positives * negatives)
+
+
+def _forecast_head(
+    train_examples: tuple[TrainingExample, ...],
+    eval_examples: tuple[TrainingExample, ...],
+    horizons: tuple[int, ...],
+    means: tuple[float, ...],
+    scales: tuple[float, ...],
+    *,
+    epochs: int,
+    learning_rate: float,
+    weight_decay: float,
+    device: str,
+) -> tuple[list[list[float]], list[float], dict[int, dict[str, float]]]:
+    # One shared head with a sigmoid output per horizon (multi-label): "does an episode start
+    # within h days?" Rare positives at short horizons, so weight the loss by class balance.
+    features = _feature_matrix(train_examples, means, scales, device)
+    targets = torch.tensor(
+        [example.forecast for example in train_examples],
+        dtype=torch.float32,
+        device=device,
+    )
+    base_rate = targets.mean(dim=0).clamp(1e-6, 1 - 1e-6)
+    torch.manual_seed(0)
+    head = torch.nn.Linear(features.shape[1], len(horizons)).to(device)
+    optimizer = torch.optim.Adam(
+        head.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=(1 - base_rate) / base_rate)
+    for _ in range(epochs):
+        optimizer.zero_grad()
+        loss_fn(head(features), targets).backward()
+        optimizer.step()
+
+    eval_features = _feature_matrix(eval_examples, means, scales, device)
+    eval_targets = torch.tensor(
+        [example.forecast for example in eval_examples],
+        dtype=torch.float32,
+        device=device,
+    )
+    with torch.no_grad():
+        probabilities = torch.sigmoid(head(eval_features))
+    metrics: dict[int, dict[str, float]] = {}
+    for index, horizon in enumerate(horizons):
+        scores = probabilities[:, index]
+        labels = eval_targets[:, index]
+        predicted = scores >= 0.5
+        true_positive = (predicted & (labels == 1)).sum().item()
+        false_positive = (predicted & (labels == 0)).sum().item()
+        false_negative = ((~predicted) & (labels == 1)).sum().item()
+        metrics[horizon] = {
+            "base_rate": labels.mean().item(),
+            "auc": _binary_auc(scores, labels),
+            "precision": true_positive / max(true_positive + false_positive, 1),
+            "recall": true_positive / max(true_positive + false_negative, 1),
+        }
+    return (
+        head.weight.detach().cpu().tolist(),
+        head.bias.detach().cpu().tolist(),
+        metrics,
+    )
+
+
 def _profile_eval(
     config: TrainingConfig,
     labels: tuple[str, ...],
@@ -649,20 +704,21 @@ def _profile_eval(
     scales: tuple[float, ...],
 ) -> tuple[ProfileEval, ...]:
     day = flare_window(config.days).midpoint
-    feature_keys = _feature_keys(config.pack)
+    signal_keys = _signal_keys(config.pack)
     evaluations = []
     for profile_name, profile in ATTUNEFM_PROFILES.items():
-        memory = generate(
-            PACKS[config.pack],
-            days=config.days,
-            profile=_profile_variant(profile, config.eval_seed_offsets[0]),
+        memory = patient_memory(
+            config, _profile_variant(profile, config.eval_seed_offsets[0])
         )
         engine = Engine(PACKS[config.pack], memory)
-        features = _features(config.pack, memory, day=day)
-        x = _standardize(
-            _vector(feature_keys, features, memory, day=day), means, scales
+        features = featurize_memory(PACKS[config.pack], memory, day=day)
+        values = series_by_day(memory, signal_keys, config.days)
+        x = standardize(
+            window_features(values, signal_keys, day=day, window=config.feature_window),
+            means,
+            scales,
         )
-        probs = _predict_proba(x, weights, bias)
+        probs = predict_proba(x, weights, bias)
         predicted_index = max(range(len(labels)), key=probs.__getitem__)
         active_axes = tuple(
             axis
@@ -689,11 +745,29 @@ def _wandb_config(config: TrainingConfig) -> dict[str, object]:
         "dataset_names": list(config.dataset_names),
         "train_seed_offsets": list(config.train_seed_offsets),
         "eval_seed_offsets": list(config.eval_seed_offsets),
-        "temporal_periods": [
-            {"period": period, "day": day}
-            for period, day in _temporal_periods(config.days)
-        ],
     }
+
+
+def _sample_examples(
+    examples: tuple[TrainingExample, ...], *, limit: int = EXAMPLE_LOG_LIMIT
+) -> tuple[TrainingExample, ...]:
+    # An all-day dataset is thousands of rows and mostly baseline days. Keep every non-baseline
+    # day (rare and the interesting ones) and evenly sample baseline to fill the budget, so the
+    # logged table and heatmap stay small without ever dropping a flare.
+    notable = tuple(item for item in examples if item.period != "baseline")
+    baseline = tuple(item for item in examples if item.period == "baseline")
+    if len(notable) >= limit:
+        return _even_sample(notable, limit=limit)
+    return (*notable, *_even_sample(baseline, limit=limit - len(notable)))
+
+
+def _even_sample(items: tuple, *, limit: int) -> tuple:
+    if limit <= 0:
+        return ()
+    if len(items) <= limit:
+        return items
+    step = (len(items) - 1) / (limit - 1) if limit > 1 else 0.0
+    return tuple(items[round(index * step)] for index in range(limit))
 
 
 def _wandb_examples_table(wandb, run: TrainingRun):
@@ -708,8 +782,8 @@ def _wandb_examples_table(wandb, run: TrainingRun):
     ]
     rows = []
     for split, examples in (
-        ("train", run.train_examples),
-        ("eval", run.eval_examples),
+        ("train", _sample_examples(run.train_examples)),
+        ("eval", _sample_examples(run.eval_examples)),
     ):
         for index, example in enumerate(examples):
             rows.append(
@@ -747,6 +821,32 @@ def _wandb_input_split_table(wandb, run: TrainingRun):
         data=[
             ["train", len(run.train_examples)],
             ["eval", len(run.eval_examples)],
+        ],
+    )
+
+
+def _wandb_forecast_table(wandb, run: TrainingRun):
+    return wandb.Table(
+        columns=["horizon", "auc", "precision", "recall", "base_rate"],
+        data=[
+            [
+                f"{horizon}d",
+                scores["auc"],
+                scores["precision"],
+                scores["recall"],
+                scores["base_rate"],
+            ]
+            for horizon, scores in sorted(run.forecast_metrics.items())
+        ],
+    )
+
+
+def _wandb_period_accuracy_table(wandb, run: TrainingRun):
+    return wandb.Table(
+        columns=["period", "eval_accuracy"],
+        data=[
+            [period, accuracy]
+            for period, accuracy in sorted(run.eval_accuracy_by_period.items())
         ],
     )
 
@@ -836,7 +936,10 @@ def _heat_color(value: float) -> bytes:
 
 def _write_feature_heatmap(run: TrainingRun) -> Path:
     cell_size = 8
-    examples = (*run.train_examples, *run.eval_examples)
+    examples = (
+        *_sample_examples(run.train_examples, limit=HEATMAP_ROW_LIMIT),
+        *_sample_examples(run.eval_examples, limit=HEATMAP_ROW_LIMIT),
+    )
     width = max(1, len(run.signal_keys) * cell_size)
     height = max(1, len(examples) * cell_size)
     rows = []
@@ -878,6 +981,8 @@ def _log_wandb(run: TrainingRun) -> str | None:
             {
                 "train/accuracy": run.train_accuracy,
                 "eval/accuracy": run.eval_accuracy,
+                "eval/active_accuracy": run.eval_active_accuracy,
+                "train/active_accuracy": run.train_active_accuracy,
                 "train/final_loss": run.final_loss,
                 "train/epochs": run.config.epochs,
                 "train/examples": len(run.train_examples),
@@ -891,13 +996,19 @@ def _log_wandb(run: TrainingRun) -> str | None:
                 "train/checkin_missing_records": sum(
                     not record.answered for record in run.checkin_records
                 ),
-                "train/temporal_periods": len(_temporal_periods(run.config.days)),
+                "train/day_types": len({e.period for e in run.train_examples}),
+                **{
+                    f"forecast/auc_{horizon}d": scores["auc"]
+                    for horizon, scores in run.forecast_metrics.items()
+                },
             }
         )
         wandb_run.log({"training/input_examples": _wandb_examples_table(wandb, run)})
         wandb_run.log({"training/checkin_examples": _wandb_checkin_table(wandb, run)})
         profile_table = _wandb_profile_confidence_table(wandb, run)
         split_table = _wandb_input_split_table(wandb, run)
+        forecast_table = _wandb_forecast_table(wandb, run)
+        period_table = _wandb_period_accuracy_table(wandb, run)
         heatmap_path = _write_feature_heatmap(run)
         wandb_run.log(
             {
@@ -912,6 +1023,18 @@ def _log_wandb(run: TrainingRun) -> str | None:
                     "split",
                     "examples",
                     title="Input examples by split",
+                ),
+                "plots/forecast_auc": wandb.plot.bar(
+                    forecast_table,
+                    "horizon",
+                    "auc",
+                    title="Episode-forecast AUC by horizon",
+                ),
+                "plots/eval_accuracy_by_period": wandb.plot.bar(
+                    period_table,
+                    "period",
+                    "eval_accuracy",
+                    title="Diagnosis accuracy by day type",
                 ),
                 "images/input_feature_heatmap": wandb.Image(
                     str(heatmap_path),
@@ -940,7 +1063,7 @@ def _log_wandb(run: TrainingRun) -> str | None:
 def train_attunefm_lite(
     config: TrainingConfig | None = None, *, wandb_enabled: bool | None = None
 ) -> TrainingRun:
-    config = config or build_training_config("smoke")
+    config = config or build_training_config("one_year")
     load_env()
     build_training_plan(
         pack=config.pack,
@@ -952,16 +1075,18 @@ def train_attunefm_lite(
     train_examples = _examples(config, config.train_seed_offsets)
     eval_examples = _examples(config, config.eval_seed_offsets)
     checkin_records = _checkin_records(config)
+    device = _select_device(config.accelerator)
     weights, bias, means, scales, final_loss = _train_linear_classifier(
         train_examples,
         labels,
         epochs=config.epochs,
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
+        device=device,
     )
     train_accuracy = _accuracy(train_examples, labels, weights, bias, means, scales)
     eval_accuracy = _accuracy(eval_examples, labels, weights, bias, means, scales)
-    active = _active_periods(config.days)
+    active = ACTIVE_PERIODS
     train_active_accuracy = _active_accuracy(
         train_examples, labels, weights, bias, means, scales, active=active
     )
@@ -970,6 +1095,17 @@ def train_attunefm_lite(
     )
     eval_accuracy_by_period = _accuracy_by_period(
         eval_examples, labels, weights, bias, means, scales
+    )
+    forecast_weights, forecast_bias, forecast_metrics = _forecast_head(
+        train_examples,
+        eval_examples,
+        config.forecast_horizons,
+        means,
+        scales,
+        epochs=config.epochs,
+        learning_rate=config.learning_rate,
+        weight_decay=config.weight_decay,
+        device=device,
     )
     evaluations = _profile_eval(config, labels, weights, bias, means, scales)
 
@@ -981,34 +1117,41 @@ def train_attunefm_lite(
     checkin_path = config.output_dir / f"attunefm-lite-{config.name}-checkins.jsonl"
     source_signal_records = _write_source_signal_records(config, source_signal_path)
     _write_checkin_records(checkin_path, checkin_records)
+    model = CheckpointModel(
+        pack=config.pack,
+        feature_window=config.feature_window,
+        labels=labels,
+        feature_mean=means,
+        feature_scale=scales,
+        weights=weights,
+        bias=bias,
+        forecast_weights=forecast_weights,
+        forecast_bias=forecast_bias,
+        forecast_horizons=config.forecast_horizons,
+    )
     checkpoint = {
-        "schema": "attunefm-lite-linear-v1",
+        **model.to_dict(),
         "config": {**asdict(config), "output_dir": str(config.output_dir)},
         "artifacts": {
             "checkpoint_path": str(checkpoint_path),
             "source_signal_records_path": str(source_signal_path),
             "checkin_records_path": str(checkin_path),
         },
-        "temporal_periods": [
-            {"period": period, "day": day}
-            for period, day in _temporal_periods(config.days)
-        ],
-        "labels": labels,
-        "signal_keys": _feature_keys(config.pack),
-        "feature_mean": means,
-        "feature_scale": scales,
-        "weights": weights,
-        "bias": bias,
+        "day_types": sorted({example.period for example in train_examples}),
+        "signal_keys": window_feature_keys(PACKS[config.pack]),
         "metrics": {
             "train_accuracy": train_accuracy,
             "eval_accuracy": eval_accuracy,
             "train_active_accuracy": train_active_accuracy,
             "eval_active_accuracy": eval_active_accuracy,
             "eval_accuracy_by_period": eval_accuracy_by_period,
+            "forecast": {
+                str(horizon): scores for horizon, scores in forecast_metrics.items()
+            },
             "final_loss": final_loss,
             "train_examples": len(train_examples),
             "eval_examples": len(eval_examples),
-            "feature_columns": len(_feature_keys(config.pack)),
+            "feature_columns": len(window_feature_keys(PACKS[config.pack])),
             "source_signal_records": source_signal_records,
             "checkin_records": len(checkin_records),
             "checkin_captured_records": sum(
@@ -1022,7 +1165,7 @@ def train_attunefm_lite(
     checkpoint_path.write_text(json.dumps(checkpoint, indent=2))
     run = TrainingRun(
         config=config,
-        signal_keys=_feature_keys(config.pack),
+        signal_keys=window_feature_keys(PACKS[config.pack]),
         train_examples=train_examples,
         eval_examples=eval_examples,
         checkin_records=checkin_records,
@@ -1031,6 +1174,7 @@ def train_attunefm_lite(
         train_active_accuracy=train_active_accuracy,
         eval_active_accuracy=eval_active_accuracy,
         eval_accuracy_by_period=eval_accuracy_by_period,
+        forecast_metrics=forecast_metrics,
         final_loss=final_loss,
         checkpoint_path=checkpoint_path,
         source_signal_path=source_signal_path,
@@ -1087,14 +1231,17 @@ def _render_run(run: TrainingRun) -> None:
         f"{sum(record.answered for record in run.checkin_records):,} responses "
         f"/ {sum(not record.answered for record in run.checkin_records):,} missed"
     )
+    period_count = len({example.period for example in run.train_examples})
     console.print(
         "[bold]Temporal examples:[/] "
         f"{len(run.train_examples):,} train / {len(run.eval_examples):,} eval "
-        f"across {len(_temporal_periods(run.config.days))} periods"
+        f"across {period_count} day types"
     )
     console.print(f"[bold]Feature columns:[/] {len(run.signal_keys)}")
-    console.print(f"[bold]Train accuracy:[/] {run.train_accuracy:.0%}")
-    console.print(f"[bold]Eval accuracy:[/] {run.eval_accuracy:.0%}")
+    console.print(
+        f"[bold]Diagnosis eval accuracy:[/] {run.eval_accuracy:.0%} "
+        f"(active/drift days {run.eval_active_accuracy:.0%})"
+    )
     console.print(f"[bold]Final loss:[/] {run.final_loss:.3f}")
     console.print(f"[bold]Checkpoint:[/] {run.checkpoint_path}")
     console.print(f"[bold]Source signal data:[/] {run.source_signal_path}")
@@ -1115,11 +1262,24 @@ def _render_run(run: TrainingRun) -> None:
         )
     console.print(eval_table)
 
+    forecast_table = Table(
+        "episode forecast", "base rate", "AUC", "precision", "recall"
+    )
+    for horizon, scores in sorted(run.forecast_metrics.items()):
+        forecast_table.add_row(
+            f"within {horizon}d",
+            f"{scores['base_rate']:.0%}",
+            f"{scores['auc']:.3f}",
+            f"{scores['precision']:.2f}",
+            f"{scores['recall']:.2f}",
+        )
+    console.print(forecast_table)
+
 
 def main(
     config: str = typer.Option(
-        "smoke",
-        help="Training config preset: debug | smoke | one_year | a100_train | a100_full.",
+        "one_year",
+        help="Training config preset: smoke | one_year | a100.",
     ),
     pack: str | None = typer.Option(None, help="Condition pack override."),
     datasets: str = typer.Option(
@@ -1157,8 +1317,8 @@ def main(
 
 def train_main(
     config: str = typer.Option(
-        "smoke",
-        help="Training config preset: debug | smoke | one_year | a100_train | a100_full.",
+        "one_year",
+        help="Training config preset: smoke | one_year | a100.",
     ),
     output_dir: Path | None = typer.Option(None, help="Checkpoint output directory."),
     epochs: int | None = typer.Option(

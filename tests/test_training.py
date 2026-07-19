@@ -39,30 +39,20 @@ def test_training_plan_validates_and_summarizes_public_datasets():
 
 
 def test_training_config_presets_separate_smoke_and_a100_targets():
-    debug = build_training_config("debug")
     smoke = build_training_config("smoke")
     one_year = build_training_config("one_year")
-    a100 = build_training_config("a100_train")
-    a100_full = build_training_config("a100_full")
+    a100 = build_training_config("a100")
 
-    assert debug.name == "debug"
-    assert debug.epochs < smoke.epochs
-    assert len(debug.train_seed_offsets) < len(smoke.train_seed_offsets)
+    # smoke: fast local CI sanity; one_year: the local default; a100: the scaled GPU target
     assert smoke.name == "smoke"
     assert smoke.accelerator == "cpu"
     assert one_year.name == "one_year"
     assert one_year.days == 365
     assert one_year.epochs > smoke.epochs
-    assert smoke.epochs < a100.epochs
-    assert a100.name == "a100_train"
+    assert a100.name == "a100"
     assert a100.accelerator == "a100-80gb"
-    assert a100.days == one_year.days
-    assert a100.max_hours == 6
-    assert len(a100.train_seed_offsets) > len(smoke.train_seed_offsets)
-    assert a100_full.name == "a100_full"
-    assert a100_full.days >= a100.days
-    assert a100_full.epochs > a100.epochs
-    assert len(a100_full.train_seed_offsets) > len(a100.train_seed_offsets)
+    assert a100.days == one_year.days  # a full year of data on the GPU target too
+    assert len(a100.train_seed_offsets) > len(one_year.train_seed_offsets)
 
 
 def test_training_config_loads_from_yaml_path():
@@ -302,6 +292,41 @@ def test_one_year_checkins_cover_profiles_and_realistic_missing_days(tmp_path):
     )
 
 
+def test_forecast_heads_learn_episode_onset_ahead_of_time(tmp_path):
+    config = build_training_config("one_year", output_dir=tmp_path, epochs=300)
+    run = train_attunefm_lite(config, wandb_enabled=False)
+
+    assert tuple(run.forecast_metrics) == config.forecast_horizons
+    for horizon, scores in run.forecast_metrics.items():
+        # a relapsing episode within `horizon` days is genuinely predictable from the trailing
+        # window — well above the 0.5 chance AUC, but not a saturated 1.0
+        assert 0.65 < scores["auc"] < 0.95, (horizon, scores["auc"])
+        assert 0.0 <= scores["base_rate"] <= 1.0
+    checkpoint = json.loads(run.checkpoint_path.read_text())
+    assert set(checkpoint["metrics"]["forecast"]) == {
+        str(horizon) for horizon in config.forecast_horizons
+    }
+
+
+def test_terra_sourced_training_matches_the_generator(tmp_path):
+    from dataclasses import replace
+
+    generator = train_attunefm_lite(
+        build_training_config("smoke", output_dir=tmp_path / "gen", epochs=40),
+        wandb_enabled=False,
+    )
+    terra = train_attunefm_lite(
+        replace(
+            build_training_config("smoke", output_dir=tmp_path / "terra", epochs=40),
+            source="terra",
+        ),
+        wandb_enabled=False,
+    )
+    # wearables round-trip through Terra exactly, so the model sees identical training data
+    assert terra.eval_accuracy == generator.eval_accuracy
+    assert terra.forecast_metrics == generator.forecast_metrics
+
+
 def test_train_attunefm_lite_logs_to_wandb_when_enabled(tmp_path, monkeypatch):
     events = []
     tables = []
@@ -422,14 +447,22 @@ def test_train_attunefm_lite_logs_to_wandb_when_enabled(tmp_path, monkeypatch):
     assert (
         visual_payload["plots/input_split_counts"]["title"] == "Input examples by split"
     )
+    assert (
+        visual_payload["plots/forecast_auc"]["title"]
+        == "Episode-forecast AUC by horizon"
+    )
+    assert (
+        visual_payload["plots/eval_accuracy_by_period"]["title"]
+        == "Diagnosis accuracy by day type"
+    )
     heatmap = visual_payload["images/input_feature_heatmap"]
     assert heatmap.caption == "AttuneFM input feature z-score heatmap"
     assert Path(heatmap.path).read_bytes().startswith(b"\x89PNG")
     assert input_table in tables
     assert checkin_table in tables
-    assert len(tables) == 4
+    assert len(tables) == 6
     assert len(images) == 1
-    assert len(plots) == 2
+    assert len(plots) == 4
 
 
 def test_train_attunefm_lite_logs_to_wandb_by_default(tmp_path, monkeypatch):
