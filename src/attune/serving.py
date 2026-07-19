@@ -1,13 +1,13 @@
-"""Serving layer — a mock backend that ingests Rook data and returns AttuneFM predictions.
+"""Serving layer — a mock backend that ingests Terra data and returns AttuneFM predictions.
 
-Closes the train -> serve loop: load a trained checkpoint, accept Rook-shaped wearable payloads
+Closes the train -> serve loop: load a trained checkpoint, accept Terra-shaped wearable payloads
 (the objective channel) plus check-in signals (the subjective channel) into a per-user memory,
 and return a prediction — diagnosis (which profile) + forecast (episode onset within each horizon)
-— emitted as a Rook-styled document so the whole system speaks one interface.
+— emitted as a Terra-styled payload so the whole system speaks one interface.
 
 The linear + forecast heads are applied in pure Python from the checkpoint's weights, so serving
-needs no torch and no training code. Swap `RookIngestSession.ingest_rook`'s source for the live
-Rook webhook and the prediction path is unchanged.
+needs no torch and no training code. Swap `TerraIngestSession.ingest_terra`'s source for the live
+Terra webhook and the prediction path is unchanged.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from attune.attunefm import (
 from attune.concordance_engine.engine import PACKS
 from attune.concordance_engine.memory import Memory, Signal
 from attune.packs.base import ConditionPack
-from attune.rook import ROOK_VERSION, rook_datetime, signals_from_rook
+from attune.terra import signals_from_terra, terra_datetime, terra_envelope
 
 MODEL_NAME = "attunefm-lite"
 
@@ -98,54 +98,52 @@ def load_predictor(checkpoint_path: Path) -> AttuneFMPredictor:
     )
 
 
-def to_rook_prediction(
+def to_terra_prediction(
     prediction: Prediction, *, day: int, user_id: str = "mock-user"
 ) -> dict:
-    """Emit a prediction as a Rook-styled document, so serving output matches the input interface."""
-    when = rook_datetime(day)
-    return {
-        "version": ROOK_VERSION,
-        "data_structure": "attunefm_prediction",
-        "created_at": when,
-        "attunefm_prediction": {
-            "predictions": [
-                {
-                    "metadata": {
-                        "datetime_string": when,
-                        "user_id_string": user_id,
-                        "model_string": MODEL_NAME,
+    """Emit a prediction as a Terra-styled payload, so serving output matches the input interface."""
+    when = terra_datetime(day)
+    return terra_envelope(
+        "attunefm_prediction",
+        user_id=user_id,
+        provider=MODEL_NAME,
+        data=[
+            {
+                "metadata": {
+                    "start_time": when,
+                    "end_time": when,
+                    "upload_type": 0,
+                },
+                "diagnosis": {
+                    "predicted_profile_string": prediction.profile,
+                    "confidence_number": round(prediction.confidence, 4),
+                    "profile_scores_object": {
+                        profile: round(score, 4)
+                        for profile, score in prediction.profile_scores.items()
                     },
-                    "diagnosis": {
-                        "predicted_profile_string": prediction.profile,
-                        "confidence_number": round(prediction.confidence, 4),
-                        "profile_scores_object": {
-                            profile: round(score, 4)
-                            for profile, score in prediction.profile_scores.items()
-                        },
-                    },
-                    "forecast_events": [
-                        {
-                            "horizon_days_int": horizon,
-                            "episode_probability_number": round(probability, 4),
-                        }
-                        for horizon, probability in prediction.forecast.items()
-                    ],
-                }
-            ]
-        },
-    }
+                },
+                "forecast_events": [
+                    {
+                        "horizon_days_int": horizon,
+                        "episode_probability_number": round(probability, 4),
+                    }
+                    for horizon, probability in prediction.forecast.items()
+                ],
+            }
+        ],
+    )
 
 
 @dataclass
-class RookIngestSession:
-    """Mock backend: ingest a user's Rook + check-in stream, then predict in Rook format."""
+class TerraIngestSession:
+    """Mock backend: ingest a user's Terra + check-in stream, then predict in Terra format."""
 
     predictor: AttuneFMPredictor
     user_id: str = "mock-user"
     memory: Memory = field(default_factory=Memory)
 
-    def ingest_rook(self, documents: dict[str, dict], day: int) -> None:
-        for signal in signals_from_rook(documents, self.predictor.pack, day):
+    def ingest_terra(self, payloads: dict[str, dict], day: int) -> None:
+        for signal in signals_from_terra(payloads, self.predictor.pack, day):
             self.memory.add(signal)
 
     def ingest_checkin(self, signals: list[Signal]) -> None:
@@ -154,4 +152,4 @@ class RookIngestSession:
 
     def predict(self, day: int) -> dict:
         prediction = self.predictor.predict(self.memory, day)
-        return to_rook_prediction(prediction, day=day, user_id=self.user_id)
+        return to_terra_prediction(prediction, day=day, user_id=self.user_id)

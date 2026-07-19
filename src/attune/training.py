@@ -31,7 +31,7 @@ from attune.concordance_engine.concordance import BASELINE_SPAN
 from attune.concordance_engine.engine import Engine, PACKS
 from attune.concordance_engine.memory import Memory
 from attune.datasets import DATASET_CATALOG, DEMO_DATASET_NAMES, DatasetStub
-from attune.rook import ingest_daily_rook
+from attune.terra import ingest_daily_terra
 from attune.synth import (
     ACTIVE_PERIODS,
     ATTUNEFM_PROFILES,
@@ -83,7 +83,7 @@ class TrainingConfig:
         30,
     )  # days ahead for episode-onset forecasting
     source: str = (
-        "generator"  # "generator" | "rook" — objective channel via the Rook interface
+        "generator"  # "generator" | "terra" — objective channel via the Terra interface
     )
 
 
@@ -187,9 +187,9 @@ def _load_training_config_file(name: str) -> TrainingConfig:
         raw.get("dataset_names", _default_datasets()), field="dataset_names"
     )
     source = str(raw.get("source", "generator"))
-    if source not in {"generator", "rook"}:
+    if source not in {"generator", "terra"}:
         raise ValueError(
-            f"training config 'source' must be 'generator' or 'rook', got {source!r}"
+            f"training config 'source' must be 'generator' or 'terra', got {source!r}"
         )
     return TrainingConfig(
         name=config_name,
@@ -300,9 +300,9 @@ def patient_memory(config: TrainingConfig, variant: PatientProfile) -> Memory:
     if cached is None:
         pack = PACKS[config.pack]
         cached = generate(pack, days=config.days, profile=variant)
-        if config.source == "rook":
-            # the objective (wearable) channel arrives via the Rook interface, not the generator
-            cached = ingest_daily_rook(cached, pack, config.days)
+        if config.source == "terra":
+            # the objective (wearable) channel arrives via the Terra interface, not the generator
+            cached = ingest_daily_terra(cached, pack, config.days)
         MEMORY_CACHE[key] = cached
     return cached
 

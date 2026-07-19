@@ -1,26 +1,26 @@
 from attune.concordance_engine.engine import PACKS
-from attune.rook import ROOK_MAPPING, to_rook_day
-from attune.serving import RookIngestSession, load_predictor
+from attune.serving import TerraIngestSession, load_predictor
 from attune.synth import ATTUNEFM_PROFILES, flare_window, generate
+from attune.terra import TERRA_MAPPING, TERRA_VERSION, to_terra_day
 from attune.training import build_training_config, train_attunefm_lite
 
 PACK = PACKS["attunefm"]
-WEARABLE = set(ROOK_MAPPING)
+WEARABLE = set(TERRA_MAPPING)
 
 
 def _serve_patient(predictor, profile: str, day: int) -> dict:
     # feed one patient's stream into the mock backend through the two channels, then predict
     memory = generate(PACK, days=90, profile=profile)
-    session = RookIngestSession(predictor, user_id=f"u-{profile}")
+    session = TerraIngestSession(predictor, user_id=f"u-{profile}")
     for d in range(day + 1):
-        session.ingest_rook(to_rook_day(memory, d), d)
+        session.ingest_terra(to_terra_day(memory, d), d)
         session.ingest_checkin(
             [s for s in memory.window(d, 1) if s.key not in WEARABLE]
         )
     return session.predict(day)
 
 
-def test_serving_ingests_rook_and_predicts_in_rook_format(tmp_path):
+def test_serving_ingests_terra_and_predicts_in_terra_format(tmp_path):
     run = train_attunefm_lite(
         build_training_config("smoke", output_dir=tmp_path, epochs=60),
         wandb_enabled=False,
@@ -28,11 +28,11 @@ def test_serving_ingests_rook_and_predicts_in_rook_format(tmp_path):
     predictor = load_predictor(run.checkpoint_path)
     result = _serve_patient(predictor, "veteran", flare_window(90).midpoint)
 
-    # output is a Rook-styled document
-    assert result["version"] == 2
-    assert result["data_structure"] == "attunefm_prediction"
-    prediction = result["attunefm_prediction"]["predictions"][0]
-    assert prediction["metadata"]["model_string"] == "attunefm-lite"
+    # output is a Terra-styled payload
+    assert result["type"] == "attunefm_prediction"
+    assert result["version"] == TERRA_VERSION
+    assert result["user"]["provider"] == "attunefm-lite"
+    prediction = result["data"][0]
 
     diagnosis = prediction["diagnosis"]
     assert diagnosis["predicted_profile_string"] == "veteran"  # correct on a flare day

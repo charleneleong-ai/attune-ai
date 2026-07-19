@@ -1,9 +1,9 @@
-"""Thin FastAPI wrapper over the Rook serving layer.
+"""Thin FastAPI wrapper over the Terra serving layer.
 
 Endpoints:
-- POST /ingest/rook     — a user's Rook wearable payloads for one day (objective channel)
+- POST /ingest/terra    — a user's Terra wearable payloads for one day (objective channel)
 - POST /ingest/checkin  — a user's check-in signals (subjective channel)
-- GET  /predict/{user_id}?day=N — the current prediction, as a Rook-styled document
+- GET  /predict/{user_id}?day=N — the current prediction, as a Terra-styled payload
 
 `create_app(predictor)` builds an app around a loaded predictor (used in tests). For a real
 server, point ATTUNE_CHECKPOINT at a training checkpoint and run:
@@ -20,14 +20,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from attune.concordance_engine.memory import Signal
-from attune.serving import AttuneFMPredictor, RookIngestSession, load_predictor
+from attune.serving import AttuneFMPredictor, TerraIngestSession, load_predictor
 
 
-class RookIngestRequest(BaseModel):
+class TerraIngestRequest(BaseModel):
     user_id: str = "mock-user"
     day: int
-    documents: dict[str, dict] = Field(
-        description="Rook documents keyed by data_structure"
+    payloads: dict[str, dict] = Field(
+        description="Terra webhook payloads keyed by data type (daily / sleep / body)"
     )
 
 
@@ -47,16 +47,16 @@ def create_app(predictor: AttuneFMPredictor) -> FastAPI:
     app = FastAPI(title="AttuneFM serving", version="0.1.0")
     # In-memory, single-process, unbounded — one session per user_id for the mock demo.
     # A real deployment would back this with a store keyed by user and evict/persist sessions.
-    sessions: dict[str, RookIngestSession] = {}
+    sessions: dict[str, TerraIngestSession] = {}
 
-    def session_for(user_id: str) -> RookIngestSession:
+    def session_for(user_id: str) -> TerraIngestSession:
         return sessions.setdefault(
-            user_id, RookIngestSession(predictor, user_id=user_id)
+            user_id, TerraIngestSession(predictor, user_id=user_id)
         )
 
-    @app.post("/ingest/rook")
-    def ingest_rook(request: RookIngestRequest) -> dict:
-        session_for(request.user_id).ingest_rook(request.documents, request.day)
+    @app.post("/ingest/terra")
+    def ingest_terra(request: TerraIngestRequest) -> dict:
+        session_for(request.user_id).ingest_terra(request.payloads, request.day)
         return {"status": "ok", "user_id": request.user_id, "day": request.day}
 
     @app.post("/ingest/checkin")
