@@ -67,3 +67,10 @@ def test_from_env_requires_both_credentials(monkeypatch):
     monkeypatch.delenv("TERRA_API_KEY", raising=False)
     with pytest.raises(RuntimeError, match="TERRA_DEV_ID and TERRA_API_KEY"):
         terra_client_from_env()
+
+
+def test_from_env_honors_base_url_override(monkeypatch):
+    monkeypatch.setenv("TERRA_DEV_ID", "dev-1")
+    monkeypatch.setenv("TERRA_API_KEY", "key-1")
+    monkeypatch.setenv("TERRA_BASE_URL", "http://localhost:8000/v2")
+    assert terra_client_from_env().base_url == "http://localhost:8000/v2"

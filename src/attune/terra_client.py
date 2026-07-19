@@ -65,4 +65,6 @@ def terra_client_from_env() -> TerraClient:
         raise RuntimeError(
             "set TERRA_DEV_ID and TERRA_API_KEY to use the live Terra client"
         )
-    return TerraClient(dev_id=dev_id, api_key=api_key)
+    # TERRA_BASE_URL overrides the endpoint — point it at the local terra_sim to demo without a key
+    base_url = os.environ.get("TERRA_BASE_URL", TERRA_BASE_URL)
+    return TerraClient(dev_id=dev_id, api_key=api_key, base_url=base_url)

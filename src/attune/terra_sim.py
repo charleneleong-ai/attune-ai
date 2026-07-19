@@ -11,17 +11,11 @@ device and no Terra account. `user_id` selects a synthetic profile; the date map
 
 from __future__ import annotations
 
-from datetime import date
-
 from fastapi import FastAPI, HTTPException
 
 from attune.concordance_engine.engine import PACKS
 from attune.synth import ATTUNEFM_PROFILES, generate
-from attune.terra import BASE_DATETIME, TERRA_MAPPING, to_terra_day
-
-
-def day_index(iso_date: str) -> int:
-    return (date.fromisoformat(iso_date) - BASE_DATETIME.date()).days
+from attune.terra import TERRA_MAPPING, terra_day, to_terra_day
 
 
 def create_terra_sim(
@@ -46,7 +40,7 @@ def create_terra_sim(
     def make_endpoint(data_type: str):
         def endpoint(user_id: str, start_date: str) -> dict:
             payloads = to_terra_day(
-                memory_for(user_id), day_index(start_date), user_id=user_id
+                memory_for(user_id), terra_day(start_date), user_id=user_id
             )
             return payloads.get(
                 data_type,

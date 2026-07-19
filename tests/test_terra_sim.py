@@ -4,9 +4,9 @@ from fastapi.testclient import TestClient
 
 from attune.concordance_engine.engine import PACKS
 from attune.synth import generate
-from attune.terra import signals_from_terra, to_terra_day
+from attune.terra import signals_from_terra, terra_day, to_terra_day
 from attune.terra_client import TerraClient
-from attune.terra_sim import create_terra_sim, day_index
+from attune.terra_sim import create_terra_sim
 
 PACK = PACKS["attunefm"]
 
@@ -17,9 +17,9 @@ def _client_against_sim() -> TerraClient:
     return TerraClient("dev", "key", base_url="http://sim/v2", http=http)
 
 
-def test_day_index_maps_dates_to_offsets():
-    assert day_index("2026-01-01") == 0
-    assert day_index("2026-02-20") == 50
+def test_terra_day_maps_dates_to_offsets():
+    assert terra_day("2026-01-01") == 0
+    assert terra_day("2026-02-20") == 50
 
 
 def test_live_client_pulls_simulated_patient_end_to_end():

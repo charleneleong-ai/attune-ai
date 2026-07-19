@@ -22,7 +22,7 @@ against the API reference when wiring the webhook.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from attune.concordance_engine.memory import Memory, Signal
 from attune.packs.base import ConditionPack
@@ -95,6 +95,16 @@ def wearable_signal_keys(pack: ConditionPack) -> tuple[str, ...]:
 
 def terra_datetime(day: int) -> str:
     return _iso(BASE_DATETIME + timedelta(days=day))
+
+
+def terra_date(day: int) -> str:
+    # the date-only form Terra's REST query params take (start_date / end_date)
+    return (BASE_DATETIME + timedelta(days=day)).date().isoformat()
+
+
+def terra_day(iso_date: str) -> int:
+    # inverse of terra_date: an ISO date back to our day index
+    return (date.fromisoformat(iso_date) - BASE_DATETIME.date()).days
 
 
 def _iso(when: datetime) -> str:
