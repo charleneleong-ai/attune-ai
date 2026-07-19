@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import random
 from dataclasses import asdict, dataclass
+from math import cos, exp, pi
 from pathlib import Path
 
 import typer
@@ -21,6 +22,16 @@ from attune.concordance_engine.memory import Memory, Signal
 from attune.packs.base import ConditionPack, SignalSpec
 
 CYCLE_DAYS = 28  # canonical cycle length for cyclic phase signals (e.g. cycle_day)
+WEARABLE_MODALITY = "wearable"
+INTRADAY_SAMPLES = 12  # readings per day (~every 2h) when intraday is enabled
+PRODROME_TAU = (
+    9.0  # days; circadian amplitude recovers with this time-constant away from onset
+)
+# The prodrome + flare blunt the autonomic circadian rhythm — amplitude shrinks before and during
+# an episode, a real signal the daily mean can't carry. Baseline/recovery days keep full amplitude.
+PRODROME_PERIODS = frozenset(
+    {"pre_flare", "flare_onset", "flare", "flare_peak", "flare_late"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,6 +336,34 @@ def sample(spec: SignalSpec, day: int, rng: random.Random) -> float:
     return spec.normal + rng.gauss(0, spec.noise)
 
 
+def _lead_days(day: int, windows: tuple[FlareWindow, ...]) -> float | None:
+    # days until the next episode onset; 0.0 while inside an episode; None if none lie ahead
+    for window in windows:
+        if window.onset <= day < window.end:
+            return 0.0
+    ahead = [window.onset - day for window in windows if window.onset > day]
+    return float(min(ahead)) if ahead else None
+
+
+def intraday_samples(
+    value: float, spec: SignalSpec, lead_days: float | None, rng: random.Random
+) -> tuple[float, ...]:
+    # Circadian amplitude blunts as an episode approaches — graded and noisy, so it is a real but
+    # imperfect prodromal signal rather than a clean step matching the forecast horizon. Samples
+    # mean ~= value, so the daily features are unchanged; only the within-day amplitude moves.
+    blunting = 0.30 * exp(-lead_days / PRODROME_TAU) if lead_days is not None else 0.0
+    amplitude = spec.noise * 2.5 * (1.0 - blunting)
+    return tuple(
+        round(
+            value
+            + amplitude * cos(2 * pi * h / INTRADAY_SAMPLES)
+            + rng.gauss(0, spec.noise * 0.8),
+            3,
+        )
+        for h in range(INTRADAY_SAMPLES)
+    )
+
+
 def _resolve_profile(profile: str | PatientProfile | None) -> PatientProfile | None:
     if profile is None:
         return None
@@ -339,10 +378,14 @@ def generate(
     days: int = 90,
     seed: int = 0,
     profile: str | PatientProfile | None = None,
+    intraday: bool = False,
 ) -> Memory:
     patient = _resolve_profile(profile)
     seed = patient.seed if patient else seed
     rng = random.Random(seed)
+    # a separate stream so intraday sampling never perturbs the daily-value draws — daily data is
+    # byte-identical whether intraday is on or off, keeping the A/B clean
+    intraday_rng = random.Random(seed ^ 0x1A7D)
     windows = flare_windows(days, seed=seed)
     flare_days = {
         day for window in windows for day in range(window.onset, min(window.end, days))
@@ -363,8 +406,21 @@ def generate(
                     else:
                         flare *= multiplier
                 value += flare  # 0.0 for signals that don't participate in the flare
+            value = round(value, 2)
+            samples = ()
+            if intraday and spec.modality == WEARABLE_MODALITY:
+                samples = intraday_samples(
+                    value, spec, _lead_days(day, windows), intraday_rng
+                )
             mem.add(
-                Signal(spec.key, spec.axis, round(value, 2), day, source=spec.modality)
+                Signal(
+                    spec.key,
+                    spec.axis,
+                    value,
+                    day,
+                    source=spec.modality,
+                    samples=samples,
+                )
             )
     return mem
 
@@ -374,7 +430,10 @@ def save(mem: Memory, path: Path) -> None:
 
 
 def load_memory(path: Path) -> Memory:
-    return Memory([Signal(**row) for row in json.loads(path.read_text())])
+    rows = json.loads(path.read_text())
+    for row in rows:  # JSON has no tuples; restore samples so Signals compare equal
+        row["samples"] = tuple(row.get("samples", ()))
+    return Memory([Signal(**row) for row in rows])
 
 
 def main(days: int = 90, out: str = "data") -> None:

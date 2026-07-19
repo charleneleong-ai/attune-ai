@@ -19,7 +19,9 @@ from rich.table import Table
 from attune.attunefm import (
     FEATURE_WINDOW,
     CheckpointModel,
+    amplitude_by_day,
     featurize_memory,
+    intraday_features,
     monitoring_scores,
     predict_proba,
     series_by_day,
@@ -31,7 +33,7 @@ from attune.concordance_engine.concordance import BASELINE_SPAN
 from attune.concordance_engine.engine import Engine, PACKS
 from attune.concordance_engine.memory import Memory
 from attune.datasets import DATASET_CATALOG, DEMO_DATASET_NAMES, DatasetStub
-from attune.terra import ingest_daily_terra
+from attune.terra import ingest_daily_terra, wearable_signal_keys
 from attune.synth import (
     ACTIVE_PERIODS,
     ATTUNEFM_PROFILES,
@@ -48,7 +50,7 @@ CONFIG_DIR = Path("configs")
 CHECKIN_LOG_LIMIT = 512
 EXAMPLE_LOG_LIMIT = 400  # per split; an all-day dataset is thousands of rows
 HEATMAP_ROW_LIMIT = 120  # per split; keeps the rendered PNG a readable height
-MEMORY_CACHE: dict[tuple[str, int, int, str], Memory] = {}
+MEMORY_CACHE: dict[tuple[str, int, int, str, bool], Memory] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +87,9 @@ class TrainingConfig:
     source: str = (
         "generator"  # "generator" | "terra" — objective channel via the Terra interface
     )
+    intraday: bool = (
+        False  # add circadian-amplitude features derived from intraday samples
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +98,10 @@ class TrainingExample:
     seed_offset: int
     day: int
     period: str
-    features: tuple[float, ...]
+    features: tuple[float, ...]  # daily features — the diagnosis head's input
+    forecast_features: tuple[
+        float, ...
+    ] = ()  # daily + intraday — the forecast head's input
     forecast: tuple[
         int, ...
     ] = ()  # 1 per horizon: an episode onsets within that many days
@@ -213,6 +221,7 @@ def _load_training_config_file(name: str) -> TrainingConfig:
             raw.get("forecast_horizons", (7, 30)), field="forecast_horizons"
         ),
         source=source,
+        intraday=bool(raw.get("intraday", False)),
     )
 
 
@@ -295,11 +304,13 @@ def _profile_variant(profile: PatientProfile, seed_offset: int) -> PatientProfil
 def patient_memory(config: TrainingConfig, variant: PatientProfile) -> Memory:
     # generate() is a pure function of (pack, days, profile variant), but four consumers each
     # rebuilt the same timelines — ~69% of the calls were redundant.
-    key = (config.pack, config.days, variant.seed, config.source)
+    key = (config.pack, config.days, variant.seed, config.source, config.intraday)
     cached = MEMORY_CACHE.get(key)
     if cached is None:
         pack = PACKS[config.pack]
-        cached = generate(pack, days=config.days, profile=variant)
+        cached = generate(
+            pack, days=config.days, profile=variant, intraday=config.intraday
+        )
         if config.source == "terra":
             # the objective (wearable) channel arrives via the Terra interface, not the generator
             cached = ingest_daily_terra(cached, pack, config.days)
@@ -459,12 +470,32 @@ def _write_checkin_records(path: Path, records: tuple[CheckinRecord, ...]) -> No
             file.write(json.dumps(asdict(record)) + "\n")
 
 
+def _forecast_features(
+    base: tuple[float, ...],
+    amplitudes: dict[str, list[float]],
+    wearable_keys: tuple[str, ...],
+    *,
+    day: int,
+    config: TrainingConfig,
+) -> tuple[float, ...]:
+    # the forecast head's vector: daily features plus the intraday amplitude columns (when enabled)
+    if not config.intraday:
+        return base
+    return (
+        *base,
+        *intraday_features(
+            amplitudes, wearable_keys, day=day, window=config.feature_window
+        ),
+    )
+
+
 def _examples(
     config: TrainingConfig, seed_offsets: tuple[int, ...]
 ) -> tuple[TrainingExample, ...]:
     # Every day of the timeline, not a handful of landmark days: the generator produces a full
     # year per patient and sampling 5 days threw away ~99% of it.
     signal_keys = _signal_keys(config.pack)
+    wearable_keys = wearable_signal_keys(PACKS[config.pack])
     first_day = max(BASELINE_SPAN, config.feature_window)
     examples = []
     for profile_name, profile in ATTUNEFM_PROFILES.items():
@@ -475,15 +506,25 @@ def _examples(
             # episodes rather than one shared window.
             windows = flare_windows(config.days, seed=variant.seed)
             values = series_by_day(memory, signal_keys, config.days)
+            amplitudes = (
+                amplitude_by_day(memory, wearable_keys, config.days)
+                if config.intraday
+                else {}
+            )
             for day in range(first_day, config.days):
+                # diagnosis sees only the daily features; the forecast head also gets intraday
+                daily = window_features(
+                    values, signal_keys, day=day, window=config.feature_window
+                )
                 examples.append(
                     TrainingExample(
                         profile=profile_name,
                         seed_offset=seed_offset,
                         day=day,
                         period=day_period(day, windows),
-                        features=window_features(
-                            values, signal_keys, day=day, window=config.feature_window
+                        features=daily,
+                        forecast_features=_forecast_features(
+                            daily, amplitudes, wearable_keys, day=day, config=config
                         ),
                         forecast=episode_onset_within(
                             day, windows, config.forecast_horizons
@@ -494,18 +535,14 @@ def _examples(
 
 
 def _mean_scale(
-    examples: tuple[TrainingExample, ...],
+    examples: tuple[TrainingExample, ...], attr: str = "features"
 ) -> tuple[tuple[float, ...], tuple[float, ...]]:
-    width = len(examples[0].features)
-    means = tuple(
-        sum(example.features[i] for example in examples) / len(examples)
-        for i in range(width)
-    )
+    rows = [getattr(example, attr) for example in examples]
+    width = len(rows[0])
+    means = tuple(sum(row[i] for row in rows) / len(rows) for i in range(width))
     scales = []
     for i, mean in enumerate(means):
-        variance = sum((example.features[i] - mean) ** 2 for example in examples) / len(
-            examples
-        )
+        variance = sum((row[i] - mean) ** 2 for row in rows) / len(rows)
         # Guard against divide-by-zero only. Flooring at 1.0 would leave every sub-unit-variance
         # signal (spo2, valence, breathlessness, voice_fatigue) effectively unstandardized, so the
         # head learns to ignore them — that alone cost ~half the single-day accuracy.
@@ -614,9 +651,10 @@ def _feature_matrix(
     means: tuple[float, ...],
     scales: tuple[float, ...],
     device: str,
+    attr: str = "features",
 ) -> torch.Tensor:
     return torch.tensor(
-        [standardize(example.features, means, scales) for example in examples],
+        [standardize(getattr(example, attr), means, scales) for example in examples],
         dtype=torch.float32,
         device=device,
     )
@@ -638,17 +676,26 @@ def _forecast_head(
     train_examples: tuple[TrainingExample, ...],
     eval_examples: tuple[TrainingExample, ...],
     horizons: tuple[int, ...],
-    means: tuple[float, ...],
-    scales: tuple[float, ...],
     *,
     epochs: int,
     learning_rate: float,
     weight_decay: float,
     device: str,
-) -> tuple[list[list[float]], list[float], dict[int, dict[str, float]]]:
+) -> tuple[
+    list[list[float]],
+    list[float],
+    tuple[float, ...],
+    tuple[float, ...],
+    dict[int, dict[str, float]],
+]:
     # One shared head with a sigmoid output per horizon (multi-label): "does an episode start
     # within h days?" Rare positives at short horizons, so weight the loss by class balance.
-    features = _feature_matrix(train_examples, means, scales, device)
+    # The forecast head owns its feature space (daily + intraday) and standardisation, so intraday
+    # timing features never touch the diagnosis head.
+    means, scales = _mean_scale(train_examples, attr="forecast_features")
+    features = _feature_matrix(
+        train_examples, means, scales, device, attr="forecast_features"
+    )
     targets = torch.tensor(
         [example.forecast for example in train_examples],
         dtype=torch.float32,
@@ -666,7 +713,9 @@ def _forecast_head(
         loss_fn(head(features), targets).backward()
         optimizer.step()
 
-    eval_features = _feature_matrix(eval_examples, means, scales, device)
+    eval_features = _feature_matrix(
+        eval_examples, means, scales, device, attr="forecast_features"
+    )
     eval_targets = torch.tensor(
         [example.forecast for example in eval_examples],
         dtype=torch.float32,
@@ -691,6 +740,8 @@ def _forecast_head(
     return (
         head.weight.detach().cpu().tolist(),
         head.bias.detach().cpu().tolist(),
+        means,
+        scales,
         metrics,
     )
 
@@ -1096,12 +1147,16 @@ def train_attunefm_lite(
     eval_accuracy_by_period = _accuracy_by_period(
         eval_examples, labels, weights, bias, means, scales
     )
-    forecast_weights, forecast_bias, forecast_metrics = _forecast_head(
+    (
+        forecast_weights,
+        forecast_bias,
+        forecast_means,
+        forecast_scales,
+        forecast_metrics,
+    ) = _forecast_head(
         train_examples,
         eval_examples,
         config.forecast_horizons,
-        means,
-        scales,
         epochs=config.epochs,
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
@@ -1127,6 +1182,8 @@ def train_attunefm_lite(
         bias=bias,
         forecast_weights=forecast_weights,
         forecast_bias=forecast_bias,
+        forecast_feature_mean=forecast_means,
+        forecast_feature_scale=forecast_scales,
         forecast_horizons=config.forecast_horizons,
     )
     checkpoint = {

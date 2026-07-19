@@ -1,3 +1,5 @@
+import pytest
+
 from attune.concordance_engine.engine import PACKS
 from attune.synth import generate
 from attune.terra import (
@@ -78,3 +80,19 @@ def test_ingest_daily_terra_reproduces_the_source_memory():
     memory = generate(PACK, days=90, profile="veteran")
     rebuilt = ingest_daily_terra(memory, PACK, days=90)
     assert _snapshot(rebuilt) == _snapshot(memory)
+
+
+def test_terra_carries_and_recovers_real_intraday_samples():
+    # with intraday generation on, the payload carries the *varied* readings (not a flat replica),
+    # and signals_from_terra recovers them — so intraday features are derivable from Terra alone
+    memory = generate(PACK, days=90, profile="veteran", intraday=True)
+    source = next(s for s in memory.window(50, 1) if s.key == "resting_hr")
+    payloads = to_terra_day(memory, 50)
+    samples = payloads["daily"]["data"][0]["heart_rate_data"]["detailed"]["hr_samples"]
+    assert (
+        len({point["bpm"] for point in samples}) > 1
+    )  # genuinely varied, not constant
+    recovered = next(
+        s for s in signals_from_terra(payloads, PACK, 50) if s.key == "resting_hr"
+    )
+    assert recovered.samples == pytest.approx(source.samples, abs=1e-3)

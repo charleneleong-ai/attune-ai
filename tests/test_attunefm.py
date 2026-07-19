@@ -1,11 +1,16 @@
+from statistics import fmean
+
 import pytest
 
 from attune.attunefm import (
     CHECKPOINT_SCHEMA,
     AttuneFMLiteModel,
     CheckpointModel,
+    amplitude_by_day,
     dataset_grounding,
     featurize_memory,
+    intraday_feature_keys,
+    intraday_features,
     monitoring_answer,
     monitoring_scores,
     modality_coverage,
@@ -13,7 +18,15 @@ from attune.attunefm import (
 from attune.concordance_engine.engine import Engine, PACKS
 from attune.datasets import DEMO_DATASET_NAMES
 from attune.packs.axes import Axis
-from attune.synth import ATTUNEFM_PROFILES, flare_window, generate
+from attune.synth import (
+    ATTUNEFM_PROFILES,
+    PRODROME_PERIODS,
+    day_period,
+    flare_window,
+    flare_windows,
+    generate,
+)
+from attune.terra import wearable_signal_keys
 
 
 def test_attunefm_pack_covers_occupational_chronic_and_visible_modalities():
@@ -188,6 +201,8 @@ class TestCheckpointModel:
         bias=[0.0, 0.5],
         forecast_weights=[[0.6, 0.7]],
         forecast_bias=[0.1],
+        forecast_feature_mean=(0.0, 1.0),
+        forecast_feature_scale=(1.0, 2.0),
         forecast_horizons=(7, 30),
     )
 
@@ -202,3 +217,50 @@ class TestCheckpointModel:
         payload = {**self.model.to_dict(), "schema": schema}
         with pytest.raises(ValueError, match="unsupported checkpoint schema"):
             CheckpointModel.from_dict(payload)
+
+
+class TestIntradayFeatures:
+    """Intraday-derived circadian-amplitude features: shape, derivation, and prodromal signal."""
+
+    pack = PACKS["attunefm"]
+    wearable = wearable_signal_keys(pack)
+
+    def test_feature_keys_are_two_per_wearable_signal(self):
+        keys = intraday_feature_keys(self.wearable)
+        assert len(keys) == 2 * len(self.wearable)
+        assert all(k.startswith("amp_") or k.startswith("mean_amp_") for k in keys)
+
+    def test_amplitude_is_intraday_range(self):
+        memory = generate(self.pack, days=90, profile="veteran", intraday=True)
+        amps = amplitude_by_day(memory, self.wearable, 90)
+        signal = next(s for s in memory.window(50, 1) if s.key in self.wearable)
+        assert amps[signal.key][50] == pytest.approx(
+            max(signal.samples) - min(signal.samples)
+        )
+
+    def test_daily_only_memory_has_zero_amplitude(self):
+        memory = generate(self.pack, days=90, profile="veteran")  # intraday off
+        amps = amplitude_by_day(memory, self.wearable, 90)
+        assert all(a == 0.0 for series in amps.values() for a in series)
+
+    def test_feature_vector_width_matches_keys(self):
+        memory = generate(self.pack, days=90, profile="veteran", intraday=True)
+        amps = amplitude_by_day(memory, self.wearable, 90)
+        vector = intraday_features(amps, self.wearable, day=50, window=30)
+        assert len(vector) == len(intraday_feature_keys(self.wearable))
+
+    def test_prodrome_blunts_the_circadian_amplitude(self):
+        # the physiological signal the daily mean can't see: rhythm amplitude drops before/during
+        # a flare, so prodrome/flare days sit measurably below baseline days
+        memory = generate(self.pack, days=365, profile="veteran", intraday=True)
+        windows = flare_windows(365, seed=0)
+        amps = amplitude_by_day(memory, self.wearable, 365)["hrv"]
+        prodrome = [
+            amps[d] for d in range(365) if day_period(d, windows) in PRODROME_PERIODS
+        ]
+        baseline = [
+            amps[d]
+            for d in range(365)
+            if day_period(d, windows) not in PRODROME_PERIODS
+        ]
+        assert fmean(prodrome) < fmean(baseline)

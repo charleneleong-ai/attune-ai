@@ -36,6 +36,9 @@ class CheckpointModel:
     bias: list[float]
     forecast_weights: list[list[float]]
     forecast_bias: list[float]
+    # the forecast head owns its feature space + standardisation (daily, or daily + intraday)
+    forecast_feature_mean: tuple[float, ...]
+    forecast_feature_scale: tuple[float, ...]
     forecast_horizons: tuple[int, ...]
 
     def to_dict(self) -> dict:
@@ -50,6 +53,8 @@ class CheckpointModel:
             "bias": self.bias,
             "forecast_weights": self.forecast_weights,
             "forecast_bias": self.forecast_bias,
+            "forecast_feature_mean": list(self.forecast_feature_mean),
+            "forecast_feature_scale": list(self.forecast_feature_scale),
             "forecast_horizons": list(self.forecast_horizons),
         }
 
@@ -70,6 +75,13 @@ class CheckpointModel:
             bias=data["bias"],
             forecast_weights=data["forecast_weights"],
             forecast_bias=data["forecast_bias"],
+            # older checkpoints shared the diagnosis standardisation; fall back to it
+            forecast_feature_mean=tuple(
+                data.get("forecast_feature_mean", data["feature_mean"])
+            ),
+            forecast_feature_scale=tuple(
+                data.get("forecast_feature_scale", data["feature_scale"])
+            ),
             forecast_horizons=tuple(data["forecast_horizons"]),
         )
 
@@ -279,6 +291,47 @@ def window_features(
         means.append(mean)
         deviations.append(population_stdev(trailing, mean))
     return (*z_scores, *latest, *means, *deviations)
+
+
+def amplitude_by_day(
+    memory: Memory, wearable_keys: tuple[str, ...], days: int
+) -> dict[str, list[float]]:
+    """Per-signal daily circadian amplitude (max-min of that day's intraday samples).
+
+    The daily mean can't see within-day structure; a blunted rhythm is a prodromal marker the
+    forecast head can use. Zero for days with no intraday samples (the daily-only baseline)."""
+    amplitudes = {key: [0.0] * days for key in wearable_keys}
+    for signal in memory.signals:
+        if (
+            signal.key in amplitudes
+            and 0 <= signal.day < days
+            and len(signal.samples) >= 2
+        ):
+            amplitudes[signal.key][signal.day] = max(signal.samples) - min(
+                signal.samples
+            )
+    return amplitudes
+
+
+def intraday_feature_keys(wearable_keys: tuple[str, ...]) -> tuple[str, ...]:
+    return (
+        *(f"amp_{key}" for key in wearable_keys),  # latest day's circadian amplitude
+        *(f"mean_amp_{key}" for key in wearable_keys),  # trailing-window mean amplitude
+    )
+
+
+def intraday_features(
+    amplitudes: dict[str, list[float]],
+    wearable_keys: tuple[str, ...],
+    *,
+    day: int,
+    window: int = FEATURE_WINDOW,
+) -> tuple[float, ...]:
+    latest = tuple(amplitudes[key][day] for key in wearable_keys)
+    means = tuple(
+        fmean(amplitudes[key][max(0, day - window) : day + 1]) for key in wearable_keys
+    )
+    return (*latest, *means)
 
 
 # --- torch-free linear-head inference, shared by training (metrics) and serving ---

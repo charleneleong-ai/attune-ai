@@ -58,6 +58,8 @@ class AttuneFMPredictor:
     bias: list[float]
     forecast_weights: list[list[float]]
     forecast_bias: list[float]
+    forecast_means: tuple[float, ...]
+    forecast_scales: tuple[float, ...]
     forecast_horizons: tuple[int, ...]
 
     def predict(self, memory: Memory, day: int) -> Prediction:
@@ -66,13 +68,17 @@ class AttuneFMPredictor:
         features = window_features(
             values, signal_keys, day=day, window=self.feature_window
         )
-        x = standardize(features, self.means, self.scales)
-        scores = predict_proba(x, self.weights, self.bias)
+        scores = predict_proba(
+            standardize(features, self.means, self.scales), self.weights, self.bias
+        )
+        # the forecast head has its own standardisation; for daily-only checkpoints this feature
+        # vector matches, intraday checkpoints need amplitude features (not yet wired into serving)
+        xf = standardize(features, self.forecast_means, self.forecast_scales)
         forecast = {
             horizon: sigmoid(logit)
             for horizon, logit in zip(
                 self.forecast_horizons,
-                logits(x, self.forecast_weights, self.forecast_bias),
+                logits(xf, self.forecast_weights, self.forecast_bias),
                 strict=True,
             )
         }
@@ -94,6 +100,8 @@ def load_predictor(checkpoint_path: Path) -> AttuneFMPredictor:
         bias=model.bias,
         forecast_weights=model.forecast_weights,
         forecast_bias=model.forecast_bias,
+        forecast_means=model.forecast_feature_mean,
+        forecast_scales=model.forecast_feature_scale,
         forecast_horizons=model.forecast_horizons,
     )
 
