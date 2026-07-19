@@ -14,10 +14,17 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from math import exp
 from pathlib import Path
 
-from attune.attunefm import series_by_day, window_features
+from attune.attunefm import (
+    CheckpointModel,
+    logits,
+    predict_proba,
+    series_by_day,
+    sigmoid,
+    standardize,
+    window_features,
+)
 from attune.concordance_engine.engine import PACKS
 from attune.concordance_engine.memory import Memory, Signal
 from attune.packs.base import ConditionPack
@@ -28,10 +35,16 @@ MODEL_NAME = "attunefm-lite"
 
 @dataclass(frozen=True, slots=True)
 class Prediction:
-    profile: str  # most likely condition profile
-    confidence: float
     profile_scores: dict[str, float]
     forecast: dict[int, float]  # horizon days -> episode-onset probability
+
+    @property
+    def profile(self) -> str:  # most likely condition profile
+        return max(self.profile_scores, key=self.profile_scores.get)
+
+    @property
+    def confidence(self) -> float:
+        return self.profile_scores[self.profile]
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,44 +66,35 @@ class AttuneFMPredictor:
         features = window_features(
             values, signal_keys, day=day, window=self.feature_window
         )
-        x = [
-            (value - m) / s
-            for value, m, s in zip(features, self.means, self.scales, strict=True)
-        ]
-        scores = _softmax(
-            [_linear(row, b, x) for row, b in zip(self.weights, self.bias, strict=True)]
-        )
-        best = max(range(len(self.labels)), key=scores.__getitem__)
+        x = standardize(features, self.means, self.scales)
+        scores = predict_proba(x, self.weights, self.bias)
         forecast = {
-            horizon: _sigmoid(_linear(row, b, x))
-            for horizon, row, b in zip(
+            horizon: sigmoid(logit)
+            for horizon, logit in zip(
                 self.forecast_horizons,
-                self.forecast_weights,
-                self.forecast_bias,
+                logits(x, self.forecast_weights, self.forecast_bias),
                 strict=True,
             )
         }
         return Prediction(
-            profile=self.labels[best],
-            confidence=scores[best],
             profile_scores=dict(zip(self.labels, scores, strict=True)),
             forecast=forecast,
         )
 
 
 def load_predictor(checkpoint_path: Path) -> AttuneFMPredictor:
-    data = json.loads(Path(checkpoint_path).read_text())
+    model = CheckpointModel.from_dict(json.loads(Path(checkpoint_path).read_text()))
     return AttuneFMPredictor(
-        pack=PACKS[data["config"]["pack"]],
-        feature_window=int(data["config"]["feature_window"]),
-        means=tuple(data["feature_mean"]),
-        scales=tuple(data["feature_scale"]),
-        labels=tuple(data["labels"]),
-        weights=data["weights"],
-        bias=data["bias"],
-        forecast_weights=data["forecast_weights"],
-        forecast_bias=data["forecast_bias"],
-        forecast_horizons=tuple(data["forecast_horizons"]),
+        pack=PACKS[model.pack],
+        feature_window=model.feature_window,
+        means=model.feature_mean,
+        scales=model.feature_scale,
+        labels=model.labels,
+        weights=model.weights,
+        bias=model.bias,
+        forecast_weights=model.forecast_weights,
+        forecast_bias=model.forecast_bias,
+        forecast_horizons=model.forecast_horizons,
     )
 
 
@@ -151,18 +155,3 @@ class RookIngestSession:
     def predict(self, day: int) -> dict:
         prediction = self.predictor.predict(self.memory, day)
         return to_rook_prediction(prediction, day=day, user_id=self.user_id)
-
-
-def _linear(row: list[float], bias: float, x: list[float]) -> float:
-    return sum(weight * value for weight, value in zip(row, x, strict=True)) + bias
-
-
-def _softmax(logits: list[float]) -> list[float]:
-    peak = max(logits)
-    exponentials = [exp(value - peak) for value in logits]
-    total = sum(exponentials)
-    return [value / total for value in exponentials]
-
-
-def _sigmoid(value: float) -> float:
-    return 1.0 / (1.0 + exp(-value))

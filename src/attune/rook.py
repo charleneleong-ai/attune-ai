@@ -28,11 +28,6 @@ BASE_DATETIME = datetime(
     2026, 1, 1, tzinfo=UTC
 )  # day index 0; keeps mock datetimes deterministic
 WEARABLE_MODALITY = "wearable"
-PILLAR_SHORT = {
-    "physical_health": "physical",
-    "sleep_health": "sleep",
-    "body_health": "body",
-}
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +65,7 @@ def rook_datetime(day: int) -> str:
 
 
 def _summary(document: dict, structure: str) -> dict:
-    return document[structure][f"{PILLAR_SHORT[structure]}_summaries"][0]
+    return document[structure][f"{structure.removesuffix('_health')}_summaries"][0]
 
 
 def _empty_document(structure: str, day: int, user_id: str) -> dict:
@@ -86,7 +81,7 @@ def _empty_document(structure: str, day: int, user_id: str) -> dict:
         "version": ROOK_VERSION,
         "data_structure": structure,
         "created_at": when,
-        structure: {f"{PILLAR_SHORT[structure]}_summaries": [summary]},
+        structure: {f"{structure.removesuffix('_health')}_summaries": [summary]},
     }
 
 

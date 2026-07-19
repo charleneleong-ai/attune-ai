@@ -13,3 +13,4 @@ data/*.json
 !data/.gitkeep
 runs/
 wandb/
+.tokensave/

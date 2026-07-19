@@ -7,7 +7,6 @@ import zlib
 from binascii import crc32
 from dataclasses import asdict, dataclass, replace
 from importlib import import_module
-from math import exp
 from pathlib import Path
 from shutil import which
 
@@ -19,9 +18,12 @@ from rich.table import Table
 
 from attune.attunefm import (
     FEATURE_WINDOW,
+    CheckpointModel,
     featurize_memory,
     monitoring_scores,
+    predict_proba,
     series_by_day,
+    standardize,
     window_feature_keys,
     window_features,
 )
@@ -184,6 +186,11 @@ def _load_training_config_file(name: str) -> TrainingConfig:
     dataset_names = _tuple_strings(
         raw.get("dataset_names", _default_datasets()), field="dataset_names"
     )
+    source = str(raw.get("source", "generator"))
+    if source not in {"generator", "rook"}:
+        raise ValueError(
+            f"training config 'source' must be 'generator' or 'rook', got {source!r}"
+        )
     return TrainingConfig(
         name=config_name,
         pack=str(raw.get("pack", "attunefm")),
@@ -205,7 +212,7 @@ def _load_training_config_file(name: str) -> TrainingConfig:
         forecast_horizons=_tuple_ints(
             raw.get("forecast_horizons", (7, 30)), field="forecast_horizons"
         ),
-        source=str(raw.get("source", "generator")),
+        source=source,
     )
 
 
@@ -506,35 +513,6 @@ def _mean_scale(
     return means, tuple(scales)
 
 
-def _standardize(
-    values: tuple[float, ...], means: tuple[float, ...], scales: tuple[float, ...]
-) -> tuple[float, ...]:
-    return tuple(
-        (value - mean) / scale
-        for value, mean, scale in zip(values, means, scales, strict=True)
-    )
-
-
-def _softmax(logits: tuple[float, ...]) -> tuple[float, ...]:
-    shifted = tuple(logit - max(logits) for logit in logits)
-    exps = tuple(exp(logit) for logit in shifted)
-    total = sum(exps) or 1.0
-    return tuple(value / total for value in exps)
-
-
-def _predict_proba(
-    features: tuple[float, ...],
-    weights: list[list[float]],
-    bias: list[float],
-) -> tuple[float, ...]:
-    logits = tuple(
-        sum(weight * value for weight, value in zip(row, features, strict=True))
-        + bias[i]
-        for i, row in enumerate(weights)
-    )
-    return _softmax(logits)
-
-
 def _select_device(accelerator: str) -> str:
     if "a100" in accelerator.lower() and torch.cuda.is_available():
         return "cuda"
@@ -591,8 +569,8 @@ def _accuracy(
 ) -> float:
     correct = 0
     for example in examples:
-        x = _standardize(example.features, means, scales)
-        probs = _predict_proba(x, weights, bias)
+        x = standardize(example.features, means, scales)
+        probs = predict_proba(x, weights, bias)
         predicted = labels[max(range(len(labels)), key=probs.__getitem__)]
         correct += predicted == example.profile
     return correct / len(examples)
@@ -608,8 +586,8 @@ def _accuracy_by_period(
 ) -> dict[str, float]:
     tally: dict[str, list[int]] = {}
     for example in examples:
-        x = _standardize(example.features, means, scales)
-        probs = _predict_proba(x, weights, bias)
+        x = standardize(example.features, means, scales)
+        probs = predict_proba(x, weights, bias)
         predicted = labels[max(range(len(labels)), key=probs.__getitem__)]
         bucket = tally.setdefault(example.period, [0, 0])
         bucket[0] += predicted == example.profile
@@ -638,7 +616,7 @@ def _feature_matrix(
     device: str,
 ) -> torch.Tensor:
     return torch.tensor(
-        [_standardize(example.features, means, scales) for example in examples],
+        [standardize(example.features, means, scales) for example in examples],
         dtype=torch.float32,
         device=device,
     )
@@ -735,12 +713,12 @@ def _profile_eval(
         engine = Engine(PACKS[config.pack], memory)
         features = featurize_memory(PACKS[config.pack], memory, day=day)
         values = series_by_day(memory, signal_keys, config.days)
-        x = _standardize(
+        x = standardize(
             window_features(values, signal_keys, day=day, window=config.feature_window),
             means,
             scales,
         )
-        probs = _predict_proba(x, weights, bias)
+        probs = predict_proba(x, weights, bias)
         predicted_index = max(range(len(labels)), key=probs.__getitem__)
         active_axes = tuple(
             axis
@@ -1139,8 +1117,20 @@ def train_attunefm_lite(
     checkin_path = config.output_dir / f"attunefm-lite-{config.name}-checkins.jsonl"
     source_signal_records = _write_source_signal_records(config, source_signal_path)
     _write_checkin_records(checkin_path, checkin_records)
+    model = CheckpointModel(
+        pack=config.pack,
+        feature_window=config.feature_window,
+        labels=labels,
+        feature_mean=means,
+        feature_scale=scales,
+        weights=weights,
+        bias=bias,
+        forecast_weights=forecast_weights,
+        forecast_bias=forecast_bias,
+        forecast_horizons=config.forecast_horizons,
+    )
     checkpoint = {
-        "schema": "attunefm-lite-linear-v1",
+        **model.to_dict(),
         "config": {**asdict(config), "output_dir": str(config.output_dir)},
         "artifacts": {
             "checkpoint_path": str(checkpoint_path),
@@ -1148,15 +1138,7 @@ def train_attunefm_lite(
             "checkin_records_path": str(checkin_path),
         },
         "day_types": sorted({example.period for example in train_examples}),
-        "labels": labels,
         "signal_keys": window_feature_keys(PACKS[config.pack]),
-        "feature_mean": means,
-        "feature_scale": scales,
-        "weights": weights,
-        "bias": bias,
-        "forecast_weights": forecast_weights,
-        "forecast_bias": forecast_bias,
-        "forecast_horizons": list(config.forecast_horizons),
         "metrics": {
             "train_accuracy": train_accuracy,
             "eval_accuracy": eval_accuracy,

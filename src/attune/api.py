@@ -45,6 +45,8 @@ class CheckinIngestRequest(BaseModel):
 
 def create_app(predictor: AttuneFMPredictor) -> FastAPI:
     app = FastAPI(title="AttuneFM serving", version="0.1.0")
+    # In-memory, single-process, unbounded — one session per user_id for the mock demo.
+    # A real deployment would back this with a store keyed by user and evict/persist sessions.
     sessions: dict[str, RookIngestSession] = {}
 
     def session_for(user_id: str) -> RookIngestSession:
