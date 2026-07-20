@@ -55,6 +55,17 @@ def test_terra_day_carries_intraday_sample_arrays():
     assert all("blood_glucose_mg_per_dL" in s for s in glucose)
 
 
+def test_glucose_reads_as_physiological_mg_dl():
+    # the normalised dysregulation index surfaces as a realistic day-average glucose, not a raw 0.x
+    memory = generate(PACK, days=90, profile="metabolic_pcos")
+    glucose = to_terra_day(memory, 50)["body"]["data"][0]["glucose_data"]
+    assert 60 < glucose["day_avg_blood_glucose_mg_per_dL"] < 250
+    assert all(
+        60 < s["blood_glucose_mg_per_dL"] < 300
+        for s in glucose["blood_glucose_samples"]
+    )
+
+
 def test_terra_roundtrip_preserves_wearable_signal_values():
     memory = generate(PACK, days=90, profile="firefighter")
     payloads = to_terra_day(memory, day=40)

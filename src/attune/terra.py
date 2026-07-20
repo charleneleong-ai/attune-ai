@@ -47,7 +47,10 @@ class TerraField:
         str, ...
     ]  # nested keys to the intraday sample array ("" -> no samples)
     sample_key: str  # value field inside each sample object (Terra's per-sample naming)
-    scale: float = 1.0  # signal value * scale = Terra value (e.g. hours -> seconds)
+    # affine unit map: Terra value = signal value * scale + offset (hours -> seconds; a normalised
+    # dysregulation index -> a physiological mg/dL range). Inverted on the way back.
+    scale: float = 1.0
+    offset: float = 0.0
 
 
 # Maps each objective signal onto its Terra home. Keys must stay in lockstep with the pack's
@@ -78,11 +81,15 @@ TERRA_MAPPING: dict[str, TerraField] = {
         "",
         scale=3600.0,
     ),
+    # Terra has no glucose-variability field, so we surface this dysregulation index (rises in
+    # flares) as day-average glucose, affine-scaled into a physiological mg/dL range (~80-180).
     "glucose_variability": TerraField(
         "body",
         ("glucose_data", "day_avg_blood_glucose_mg_per_dL"),
         ("glucose_data", "blood_glucose_samples"),
         "blood_glucose_mg_per_dL",
+        scale=130.0,
+        offset=70.0,
     ),
 }
 
@@ -187,12 +194,17 @@ def to_terra_day(
                 mapping.data_type, _payload(mapping.data_type, day, user_id)
             )
         )
-        value = round(signal.value * mapping.scale, 4)
-        _set_path(model, mapping.summary_path, value)
+        _set_path(
+            model,
+            mapping.summary_path,
+            round(signal.value * mapping.scale + mapping.offset, 4),
+        )
         if mapping.sample_path:
             # carry the real intraday readings when present, else the daily value replicated
-            raw = signal.samples or (value,) * SAMPLES_PER_DAY
-            samples = tuple(round(reading * mapping.scale, 4) for reading in raw)
+            raw = signal.samples or (signal.value,) * SAMPLES_PER_DAY
+            samples = tuple(
+                round(reading * mapping.scale + mapping.offset, 4) for reading in raw
+            )
             _set_path(
                 model,
                 mapping.sample_path,
@@ -217,7 +229,10 @@ def signals_from_terra(
             continue
         raw = _get_path(model, mapping.sample_path) if mapping.sample_path else None
         samples = (
-            tuple(point[mapping.sample_key] / mapping.scale for point in raw)
+            tuple(
+                (point[mapping.sample_key] - mapping.offset) / mapping.scale
+                for point in raw
+            )
             if raw
             else ()
         )
@@ -225,7 +240,7 @@ def signals_from_terra(
             Signal(
                 key,
                 axis_of[key],
-                value / mapping.scale,
+                (value - mapping.offset) / mapping.scale,
                 day,
                 source=WEARABLE_MODALITY,
                 samples=samples,
