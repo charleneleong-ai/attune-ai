@@ -57,6 +57,11 @@ attunefm.py         monitoring scores over the shared longitudinal memory
 datasets.py         real public dataset registry for grounding each modality/head
 reporting.py        presentation layer — render a Brief to clinician markdown
 synth.py            seeded synthetic patients with a planted concordant flare
+serving.py          torch-free prediction from a checkpoint (Terra payloads in, prediction out)
+terra.py            Terra wearable-aggregator interface (mock + live-ready, behind signals_from_terra)
+terra_client.py     live Terra REST client (/v2/{daily,sleep,body}, dev-id + x-api-key)
+terra_sim.py        local Terra simulator — run the feed with no wearable and no account
+api.py              FastAPI serving wrapper (ingest / live-pull / predict)
 ```
 
 ### AttuneFM-lite architecture
@@ -219,6 +224,7 @@ Training configs live in `configs/*.yaml` (`one_year` is the default):
 |---|---:|---:|---:|---:|---|
 | `smoke` | 90 | 3 / 1 | 1,440 / 480 | 80 | fast local / CI sanity |
 | `one_year` | 365 | 3 / 1 | 8,040 / 2,680 | 400 | local default |
+| `one_year_intraday` | 365 | 3 / 1 | 8,040 / 2,680 | 400 | + intraday amplitude features |
 | `a100` | 365 | 8 / 3 | 21,440 / 8,040 | 600 | scaled GPU one-year target |
 
 The generator produces daily multimodal sensor-like records across 8 profiles (HRV, resting
@@ -234,7 +240,11 @@ profile identifiable on a calm day.
 
 - **Diagnosis** — which condition on any given day: **~98%** eval (99% on active/drift days).
 - **Forecast** — will an episode onset within 7d / 30d: **AUC ≈ 0.77** (genuine early-warning
-  signal, class-balanced BCE heads per horizon).
+  signal, class-balanced BCE heads per horizon). The `one_year_intraday` config adds
+  circadian-amplitude features derived from Terra's intraday `*_samples` and routes them to the
+  forecast head only, lifting 7d AUC to **≈ 0.95** with no diagnosis cost (see
+  [`docs/experiments/one_year_intraday.md`](docs/experiments/one_year_intraday.md); the magnitude
+  reflects the synthetic prodrome and needs real data to interpret).
 
 W&B logging is on by default; use `--no-wandb` for local runs without W&B:
 
@@ -263,6 +273,41 @@ eng.ingest(Signal("hrv", Axis.PHYSIOLOGICAL, 42.0, day=30, source="wearable"))
 finding = eng.reflect(day=30)               # concordant? which axes?
 verdict = eng.assess("rough night, no sleep", day=30)   # Green / Amber / Red
 ```
+
+## Serving & the live Terra feed
+
+The objective (wearable) channel speaks **[Terra](https://tryterra.co)**, a wearable-data
+aggregator. A torch-free serving layer loads a checkpoint and answers predictions over HTTP;
+everything sits behind `signals_from_terra`, so the data source — a mock, a simulator, or a real
+Garmin — is interchangeable and the model never knows the difference.
+
+**Run the whole thing with no wearable and no Terra account** — a local simulator serves generator
+patients at Terra's real `/v2/{daily,sleep,body}` endpoints, and the real Terra client polls it:
+
+```bash
+# 1 — fake Terra API (synthetic patients at Terra's real endpoints)
+uvicorn attune.terra_sim:app --port 8000
+
+# 2 — serving API, pointed at the simulator (TERRA_BASE_URL; the sim ignores auth)
+export ATTUNE_CHECKPOINT=runs/attunefm-one_year/attunefm-lite-one_year-checkpoint.json
+export TERRA_DEV_ID=demo TERRA_API_KEY=demo TERRA_BASE_URL=http://localhost:8000/v2
+uvicorn attune.api:app_from_env --factory --port 9000
+
+# 3 — pull the live feed, then predict
+curl -X POST localhost:9000/ingest/terra/live \
+  -d '{"user_id":"veteran","start_date":"2026-01-01","days":90}'
+curl "localhost:9000/predict/veteran?day=68"
+# -> {"type":"attunefm_prediction", ... "diagnosis":{"predicted_profile_string":"veteran", ...},
+#     "forecast_events":[{"horizon_days_int":7, ...}, {"horizon_days_int":30, ...}]}
+```
+
+`user_id` selects a synthetic profile (`veteran`, `metabolic_pcos`, `firefighter`, …); the sim
+serves realistic Terra payloads — daily summaries **and** intraday `*_samples` (HR, HRV, SpO₂,
+glucose). Point `TERRA_BASE_URL` at `https://api.tryterra.co/v2` with a real key and the exact same
+flow runs against live Terra — no code change.
+
+Endpoints (`attune.api`): `POST /ingest/terra` (raw payloads) · `POST /ingest/terra/live` (pull +
+ingest) · `POST /ingest/checkin` (subjective channel) · `GET /predict/{user_id}?day=N`.
 
 ## Build plan (hackathon)
 
