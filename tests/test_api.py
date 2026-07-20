@@ -6,6 +6,8 @@ from attune.concordance_engine.engine import PACKS
 from attune.serving import load_predictor
 from attune.synth import flare_window, generate
 from attune.terra import TERRA_MAPPING, to_terra_day
+from attune.terra_client import TerraClient
+from attune.terra_sim import create_terra_sim
 from attune.training import build_training_config, train_attunefm_lite
 
 PACK = PACKS["attunefm"]
@@ -13,14 +15,26 @@ WEARABLE = set(TERRA_MAPPING)
 
 
 @pytest.fixture(scope="module")
-def client(tmp_path_factory):
+def predictor(tmp_path_factory):
     run = train_attunefm_lite(
         build_training_config(
             "smoke", output_dir=tmp_path_factory.mktemp("api"), epochs=60
         ),
         wandb_enabled=False,
     )
-    return TestClient(create_app(load_predictor(run.checkpoint_path)))
+    return load_predictor(run.checkpoint_path)
+
+
+@pytest.fixture(scope="module")
+def client(predictor):
+    return TestClient(create_app(predictor))
+
+
+def _sim_backed_client(predictor) -> TestClient:
+    # the app's Terra client points at the local simulator — a real HTTP pull, no device
+    sim = TestClient(create_terra_sim(days=90))
+    terra = TerraClient("dev", "key", base_url="http://sim/v2", http=sim)
+    return TestClient(create_app(predictor, terra_client=terra))
 
 
 def test_ingest_then_predict_returns_terra_document(client):
@@ -61,3 +75,37 @@ def test_ingest_checkin_rejects_unknown_signal(client):
         },
     )
     assert response.status_code == 422
+
+
+def test_live_terra_pull_then_predict(predictor):
+    # full loop: pull the objective channel live from the (simulated) Terra feed + check-in, predict
+    http = _sim_backed_client(predictor)
+    memory = generate(PACK, days=90, profile="veteran")
+    day = flare_window(90).midpoint
+
+    pull = http.post(
+        "/ingest/terra/live",
+        json={"user_id": "veteran", "start_date": "2026-01-01", "days": 90},
+    )
+    assert pull.status_code == 200 and pull.json()["days_ingested"] == 90
+
+    checkins = [
+        {"key": s.key, "value": s.value, "day": s.day, "source": s.source}
+        for s in memory.signals
+        if s.key not in WEARABLE
+    ]
+    http.post("/ingest/checkin", json={"user_id": "veteran", "signals": checkins})
+
+    response = http.get("/predict/veteran", params={"day": day})
+    assert response.status_code == 200
+    assert (
+        response.json()["data"][0]["diagnosis"]["predicted_profile_string"] == "veteran"
+    )
+
+
+def test_live_pull_without_client_is_503(client):
+    response = client.post(
+        "/ingest/terra/live",
+        json={"user_id": "veteran", "start_date": "2026-01-01", "days": 7},
+    )
+    assert response.status_code == 503
